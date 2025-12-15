@@ -1,0 +1,23 @@
+{
+  "DVTSourceControlWorkspaceBlueprintPrimaryRemoteRepositoryKey" : "54CDD732D83811F25CB42D39E4B2E0FA511DF006",
+  "DVTSourceControlWorkspaceBlueprintWorkingCopyRepositoryLocationsKey" : {
+
+  },
+  "DVTSourceControlWorkspaceBlueprintWorkingCopyStatesKey" : {
+    "54CDD732D83811F25CB42D39E4B2E0FA511DF006" : 0
+  },
+  "DVTSourceControlWorkspaceBlueprintIdentifierKey" : "3634B25D-D8EF-4CB3-8068-42D2973DDC1E",
+  "DVTSourceControlWorkspaceBlueprintWorkingCopyPathsKey" : {
+    "54CDD732D83811F25CB42D39E4B2E0FA511DF006" : "Audiyo\/"
+  },
+  "DVTSourceControlWorkspaceBlueprintNameKey" : "Audiyo",
+  "DVTSourceControlWorkspaceBlueprintVersion" : 204,
+  "DVTSourceControlWorkspaceBlueprintRelativePathToProjectKey" : "Audiyo.xcodeproj",
+  "DVTSourceControlWorkspaceBlueprintRemoteRepositoriesKey" : [
+    {
+      "DVTSourceControlWorkspaceBlueprintRemoteRepositoryURLKey" : "https:\/\/github.com\/squeaksquad\/Audiyo.git",
+      "DVTSourceControlWorkspaceBlueprintRemoteRepositorySystemKey" : "com.apple.dt.Xcode.sourcecontrol.Git",
+      "DVTSourceControlWorkspaceBlueprintRemoteRepositoryIdentifierKey" : "54CDD732D83811F25CB42D39E4B2E0FA511DF006"
+    }
+  ]
+}
