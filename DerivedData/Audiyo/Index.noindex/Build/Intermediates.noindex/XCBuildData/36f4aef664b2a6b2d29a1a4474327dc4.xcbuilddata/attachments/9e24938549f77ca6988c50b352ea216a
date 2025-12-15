@@ -1,0 +1,19 @@
+{
+  "" : {
+    "dependencies" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary.d",
+    "diagnostics" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary.dia",
+    "emit-module-dependencies" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary-emit-module.dia",
+    "pch" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/Objects-normal/arm64/Audiyo-primary.swiftdeps"
+  },
+  "/Users/bdimaio/Desktop/Audiyo/Audiyo/AudiyoApp.swift" : {
+
+  },
+  "/Users/bdimaio/Desktop/Audiyo/Audiyo/ContentView.swift" : {
+
+  },
+  "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/Build/Intermediates.noindex/Audiyo.build/Debug/Audiyo.build/DerivedSources/GeneratedAssetSymbols.swift" : {
+
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "buildCommand" : {
+    "command" : "build",
+    "skipDependencies" : false,
+    "style" : "buildAndRun"
+  },
+  "configuredTargets" : [
+    {
+      "guid" : "999b8604de63719e36d15ce9c972c13bfd18403b8bdb8fcb5857498a70aefc41"
+    }
+  ],
+  "containerPath" : "/Users/bdimaio/Desktop/Audiyo/Audiyo.xcodeproj",
+  "continueBuildingAfterErrors" : false,
+  "dependencyScope" : "workspace",
+  "enableIndexBuildArena" : false,
+  "hideShellScriptEnvironment" : false,
+  "parameters" : {
+    "action" : "build",
+    "activeArchitecture" : "arm64",
+    "activeRunDestination" : {
+      "disableOnlyActiveArch" : false,
+      "platform" : "macosx",
+      "sdk" : "macosx26.1",
+      "sdkVariant" : "macos",
+      "supportedArchitectures" : [
+        "arm64e",
+        "arm64",
+        "x86_64"
+      ],
+      "targetArchitecture" : "arm64"
+    },
+    "arenaInfo" : {
+      "buildIntermediatesPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Build/Intermediates.noindex",
+      "buildProductsPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Build/Products",
+      "derivedDataPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData",
+      "indexDataStoreFolderPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/DataStore",
+      "indexEnableDataStore" : true,
+      "indexPCHPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Index.noindex/PrecompiledHeaders",
+      "pchPath" : "/Users/bdimaio/Desktop/Audiyo/DerivedData/Audiyo/Build/Intermediates.noindex/PrecompiledHeaders"
+    },
+    "configurationName" : "Release",
+    "overrides" : {
+      "synthesized" : {
+        "table" : {
+          "ENABLE_PREVIEWS" : "NO",
+          "ENABLE_XOJIT_PREVIEWS" : "YES",
+          "ONLY_ACTIVE_ARCH" : "YES"
+        }
+      }
+    }
+  },
+  "schemeCommand" : "launch",
+  "showNonLoggedProgress" : true,
+  "useDryRun" : false,
+  "useImplicitDependencies" : true,
+  "useLegacyBuildLocations" : false,
+  "useParallelTargets" : true
+}
