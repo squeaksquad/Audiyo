@@ -874,6 +874,7 @@ struct ContentView: View {
                 }
             }
         }
+        .preferredColorScheme(.dark)
         .sheet(isPresented: $showPasswordPrompt) {
             PasswordPromptView(isPresented: $showPasswordPrompt, onSuccess: {
                 player.loadLibraryFolder()
