@@ -25,14 +25,21 @@ Use Instructions:
 7. There is a “Shortcuts” button next to the Audio Device selector that lists the available keyboard shortcuts. They are as follows:
 
 	•	CMD+(1-9); Add marker
+
 	•	(1-9); Go to marker
+
 	•	0; Play from start (or loop)
+
 	•	Space bar; Play/Pause
+
 	•	I; Set Loop In
+
 	•	O; Set Loop Out
+
 	•	L; Toggle loop on/off
+
 	•	CMD+Shift+L; Reset loop region
 
-8. The loaded library folder shows up on the left side bar and the 12 track or 8 track songs libraries can be expanded to show individual songs. Simply click on the song name to load it (or to reset all markers).
+9. The loaded library folder shows up on the left side bar and the 12 track or 8 track songs libraries can be expanded to show individual songs. Simply click on the song name to load it (or to reset all markers).
 
-9. If any issues come up, restart the app or reset Core Audio and re-load the song. Issues are infrequent but many device changes can become an issue.
+10. If any issues come up, restart the app or reset Core Audio and re-load the song. Issues are infrequent but many device changes can become an issue.
