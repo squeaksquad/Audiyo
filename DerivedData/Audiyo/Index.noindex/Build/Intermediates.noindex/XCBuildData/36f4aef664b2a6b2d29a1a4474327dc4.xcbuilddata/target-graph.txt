@@ -1,2 +1,0 @@
-Target dependency graph (1 target)
-Target 'Audiyo' in project 'Audiyo' (no dependencies)
