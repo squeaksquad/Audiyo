@@ -2,7 +2,7 @@ import SwiftUI
 import AVFoundation
 import CoreAudio
 import AudioToolbox
-import Combine
+import Observation
 
 // MARK: - 1. Data Models
 
@@ -19,7 +19,8 @@ struct AudioDevice: Identifiable, Hashable {
     let name: String
 }
 
-class Track: ObservableObject, Identifiable {
+@Observable
+class Track: Identifiable {
     let id: Int
     let url: URL
     let file: AVAudioFile
@@ -30,10 +31,8 @@ class Track: ObservableObject, Identifiable {
     
     var name: String { url.deletingPathExtension().lastPathComponent }
     
-    @Published var volume: Float = 1.0
-    @Published var meterLevel: Float = -100.0
-    
-    // Performance: track last update to throttle UI
+    var volume: Float = 1.0
+    var meterLevel: Float = -100.0
     var lastUpdate: TimeInterval = 0
     
     init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, originalBuffer: AVAudioPCMBuffer, scratchBuffer: AVAudioPCMBuffer, scratchLoopBuffer: AVAudioPCMBuffer) {
@@ -53,29 +52,31 @@ class Track: ObservableObject, Identifiable {
 
 // MARK: - 2. Audio Engine
 
-class AudioPlayer: ObservableObject {
-    @Published var libraryRoot: [LibraryItem] = []
-    @Published var currentSongId: UUID?
+@MainActor
+@Observable
+class AudioPlayer {
+    var libraryRoot: [LibraryItem] = []
+    var currentSongId: UUID?
     
-    @Published var tracks: [Track] = []
-    @Published var devices: [AudioDevice] = []
-    @Published var selectedDeviceID: AudioDeviceID = 0
-    @Published var deviceSampleRate: Double = 44100.0
+    var tracks: [Track] = []
+    var devices: [AudioDevice] = []
+    var selectedDeviceID: AudioDeviceID = 0
+    var deviceSampleRate: Double = 44100.0
     
-    @Published var isPlaying = false
-    @Published var isLooping = false
-    @Published var playbackProgress: Double = 0.0
+    var isPlaying = false
+    var isLooping = false
+    var playbackProgress: Double = 0.0
     
-    @Published var markers: [Int: Double] = [:]
-    @Published var loopStart: Double = 0.0
-    @Published var loopEnd: Double = 1.0
+    var markers: [Int: Double] = [:]
+    var loopStart: Double = 0.0
+    var loopEnd: Double = 1.0
     
-    @Published var currentDisplayTime: String = "0:00"
-    @Published var totalDuration: Double = 0.0
+    var currentDisplayTime: String = "0:00"
+    var totalDuration: Double = 0.0
     var totalDurationString: String { formatTime(totalDuration) }
     
-    @Published var showError = false
-    @Published var errorMessage = ""
+    var showError = false
+    var errorMessage = ""
     
     private let engine = AVAudioEngine()
     private let mainMixer = AVAudioMixerNode()
@@ -98,11 +99,10 @@ class AudioPlayer: ObservableObject {
         setupEngine()
         fetchDevices()
         restoreSavedDevice()
-        // 1. Saved Bookmark
+        
         if restoreLastLibrary() { return }
-        // 2. Default Path
         if loadHomeDirectoryLibrary() { return }
-        // 3. Internal Fallback
+        if loadStandardMusicLibrary() { return }
         loadInternalLibrary()
     }
     
@@ -139,7 +139,7 @@ class AudioPlayer: ObservableObject {
         if let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)) {
             outputFormat = AVAudioFormat(standardFormatWithSampleRate: outputFormat.sampleRate, channelLayout: layout)
         }
-        DispatchQueue.main.async { self.deviceSampleRate = outputFormat.sampleRate }
+        self.deviceSampleRate = outputFormat.sampleRate
         self.hardwareFormat = outputFormat
         engine.connect(mainMixer, to: outputNode, format: outputFormat)
         do { try engine.start() } catch { print("Engine Error: \(error)") }
@@ -151,6 +151,7 @@ class AudioPlayer: ObservableObject {
         engine.stop()
         players.forEach { engine.detach($0) }
         
+        // Preserve volumes if reloading same tracks, otherwise default 1.0
         let savedVolumes = tracks.reduce(into: [Int: Float]()) { dict, track in
             dict[track.id] = track.volume
         }
@@ -162,11 +163,8 @@ class AudioPlayer: ObservableObject {
         guard let hwFormat = self.hardwareFormat else { return }
         if currentURLs.isEmpty { return }
         
-        // Reset Error State
-        DispatchQueue.main.async {
-            self.showError = false
-            self.errorMessage = ""
-        }
+        self.showError = false
+        self.errorMessage = ""
         
         let hardwareLimit = Int(hwFormat.channelCount)
         let filesToLoad = self.currentURLs.prefix(hardwareLimit)
@@ -186,12 +184,9 @@ class AudioPlayer: ObservableObject {
                     self.audioSampleRate = sr
                     self.totalDuration = Double(audioLengthSamples) / audioSampleRate
                     
-                    // Sample Rate Mismatch Check
                     if abs(hwFormat.sampleRate - sr) > 1.0 {
-                        DispatchQueue.main.async {
-                            self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(sr))Hz"
-                            self.showError = true
-                        }
+                        self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(sr))Hz"
+                        self.showError = true
                     }
                 }
                 
@@ -208,13 +203,12 @@ class AudioPlayer: ObservableObject {
                 tracks.append(trackObj)
                 
                 player.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] (buffer, time) in
-                    self?.processMeter(buffer: buffer, trackIndex: index, channelIndex: index)
+                    guard let self = self else { return }
+                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index)
                 }
             } catch {
-                DispatchQueue.main.async {
-                    self.errorMessage = "Error: \(error.localizedDescription)"
-                    self.showError = true
-                }
+                self.errorMessage = "Error: \(error.localizedDescription)"
+                self.showError = true
             }
         }
         try? engine.start()
@@ -338,6 +332,13 @@ class AudioPlayer: ObservableObject {
         }
     }
     
+    // NEW: Function to reset all volume trims to 1.0
+    func resetAllTrims() {
+        for i in 0..<tracks.count {
+            setVolume(1.0, index: i)
+        }
+    }
+    
     func restartIfPlaying() { if isPlaying { play(from: playbackProgress) } }
     
     func resetLoop() { loopStart = 0.0; loopEnd = 1.0; if isPlaying && isLooping { restartIfPlaying() } }
@@ -365,15 +366,7 @@ class AudioPlayer: ObservableObject {
         return String(format: "%d:%02d", m, s)
     }
     
-    private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int) {
-        guard trackIndex < self.tracks.count else { return }
-        
-        // Throttling: Ensure we don't update UI more than ~30 times a second
-        let now = CACurrentMediaTime()
-        let track = self.tracks[trackIndex]
-        if now - track.lastUpdate < 0.03 { return }
-        track.lastUpdate = now
-        
+    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int) {
         guard let floatData = buffer.floatChannelData else { return }
         if channelIndex >= Int(buffer.format.channelCount) { return }
         
@@ -389,16 +382,32 @@ class AudioPlayer: ObservableObject {
         let rms = sqrt(sum / Float(frames / strideVal))
         let avgPower = 20 * log10(rms)
         
-        DispatchQueue.main.async {
-            track.meterLevel = avgPower
+        Task { @MainActor in
+            guard trackIndex < self.tracks.count else { return }
+            let track = self.tracks[trackIndex]
+            let now = CACurrentMediaTime()
+            if now - track.lastUpdate > 0.03 {
+                track.meterLevel = avgPower
+                track.lastUpdate = now
+            }
         }
     }
     
     // MARK: - Library & Hardware
     private func loadHomeDirectoryLibrary() -> Bool {
-        // Looks for: /Users/currentUser/.Audiyo Library
         let home = FileManager.default.homeDirectoryForCurrentUser
         let url = home.appendingPathComponent(".Audiyo Library")
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            scanAndSetLibrary(at: url)
+            return true
+        }
+        return false
+    }
+    
+    private func loadStandardMusicLibrary() -> Bool {
+        guard let music = FileManager.default.urls(for: .musicDirectory, in: .userDomainMask).first else { return false }
+        let url = music.appendingPathComponent("Audiyo Library")
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
             scanAndSetLibrary(at: url)
@@ -446,13 +455,15 @@ class AudioPlayer: ObservableObject {
     }
     
     private func scanAndSetLibrary(at url: URL) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let items = self.scanDirectory(at: url)
-            DispatchQueue.main.async { self.libraryRoot = items }
+        Task.detached(priority: .userInitiated) {
+            let items = await self.scanDirectory(at: url)
+            await MainActor.run {
+                self.libraryRoot = items
+            }
         }
     }
     
-    private func scanDirectory(at url: URL) -> [LibraryItem] {
+    nonisolated private func scanDirectory(at url: URL) -> [LibraryItem] {
         let fileManager = FileManager.default
         var items: [LibraryItem] = []
         do {
@@ -546,12 +557,18 @@ func meterColor(level: Float) -> Color {
 }
 
 struct TrackRow: View {
-    @ObservedObject var track: Track
+    let track: Track
     var onVolumeChange: (Float) -> Void
+    
+    var volumeBinding: Binding<Float> {
+        Binding(
+            get: { track.volume },
+            set: { track.volume = $0; onVolumeChange($0) }
+        )
+    }
     
     var body: some View {
         HStack(spacing: 15) {
-            // Track Info
             VStack(alignment: .leading, spacing: 2) {
                 Text("CH \(track.id + 1)")
                     .font(.caption)
@@ -569,14 +586,9 @@ struct TrackRow: View {
                 .foregroundColor(.gray)
                 .frame(width: 60, alignment: .trailing)
             
-            // Volume Slider (No Text)
-            Slider(value: $track.volume, in: 0...1) { editing in
-                if !editing { onVolumeChange(track.volume) }
-            }
-            .onChange(of: track.volume) { newVal in onVolumeChange(newVal) }
-            .frame(width: 100)
+            Slider(value: volumeBinding, in: 0...1)
+                .frame(width: 100)
             
-            // Horizontal Meter
             ZStack(alignment: .leading) {
                 Rectangle().fill(Color.gray.opacity(0.3)).cornerRadius(3)
                 Rectangle()
@@ -646,11 +658,11 @@ struct ShakeEffect: GeometryEffect {
 }
 
 struct TimelineView: View {
-    @ObservedObject var player: AudioPlayer
+    let player: AudioPlayer
+    
     var body: some View {
         VStack(spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
-                // Larger Time Display
                 Text(player.currentDisplayTime)
                     .font(.system(size: 38, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
@@ -706,13 +718,13 @@ struct TimelineView: View {
 // MARK: - 4. Main View
 
 struct ContentView: View {
-    @StateObject var player = AudioPlayer()
+    @State private var player = AudioPlayer()
+    
     @State private var showShortcuts = false
     @State private var showPasswordPrompt = false
     
     var body: some View {
         HSplitView {
-            // SIDEBAR
             VStack(spacing: 0) {
                 Text("Library").font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding()
                 Divider()
@@ -733,9 +745,7 @@ struct ContentView: View {
                 }.buttonStyle(.borderless).background(Color(nsColor: .controlBackgroundColor))
             }.frame(minWidth: 250, maxWidth: 350)
             
-            // MAIN CONTENT
             VStack(spacing: 0) {
-                // Invisible Shortcuts for Keyboard Support
                 Group {
                     Button(action: { player.jumpToStart() }) {}.keyboardShortcut("0", modifiers: [])
                     Button(action: { player.jumpToMarker(at: 1) }) {}.keyboardShortcut("1", modifiers: [])
@@ -762,10 +772,7 @@ struct ContentView: View {
                     Button(action: { player.setLoopOut() }) {}.keyboardShortcut("o", modifiers: [])
                 }.frame(width: 0, height: 0).opacity(0)
                 
-                // TOP HEADER
-                HStack(alignment: .center) { // All controls vertically centered
-                    
-                    // LEFT: Transport (Play/Loop)
+                HStack(alignment: .center) {
                     HStack(spacing: 15) {
                         Button(action: player.togglePlay) {
                             Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
@@ -782,8 +789,17 @@ struct ContentView: View {
                     
                     Spacer()
                     
-                    // RIGHT GROUP: Shortcuts + Device
                     HStack(alignment: .center, spacing: 20) {
+                        
+                        // NEW BUTTON: Reset Trims
+                        Button(action: { player.resetAllTrims() }) {
+                            Text("Reset Trims")
+                                .font(.caption)
+                                .padding(8)
+                                .background(RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reset all volume faders to 100%")
                         
                         // Shortcuts Button
                         Button(action: { showShortcuts.toggle() }) {
@@ -799,7 +815,7 @@ struct ContentView: View {
                             ShortcutsView()
                         }
                         
-                        // Audio Output Selector
+                        // Device Selector
                         HStack(spacing: 8) {
                             Text("Audio Device")
                                 .font(.caption)
@@ -823,21 +839,18 @@ struct ContentView: View {
                 }
                 .padding()
                 
-                // Visual Isolation from Play Bar
                 Divider()
                 
-                // TIMELINE ROW (Full Width)
                 VStack(spacing: 0) {
                     TimelineView(player: player)
                         .padding(.horizontal)
-                        .padding(.top, 15) // Added top padding for isolation
+                        .padding(.top, 15)
                         .padding(.bottom, 15)
                 }
                 .background(Color(nsColor: .controlBackgroundColor))
                 
                 Divider()
                 
-                // MAIN CONTENT (Tracks)
                 if player.tracks.isEmpty {
                     Spacer()
                     VStack(spacing: 10) {
@@ -861,7 +874,6 @@ struct ContentView: View {
                     }
                 }
                 
-                // Footer (Errors only)
                 if player.showError {
                     HStack {
                         Spacer()

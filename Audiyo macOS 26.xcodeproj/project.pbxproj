@@ -7,13 +7,13 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		D4E208292EEB5BFB00E518F7 /* Audiyo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Audiyo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D4E208292EEB5BFB00E518F7 /* Audiyo macOS 26.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Audiyo macOS 26.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		D4E2082B2EEB5BFB00E518F7 /* Audiyo */ = {
+		D4E2082B2EEB5BFB00E518F7 /* Audiyo macOS 26 */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Audiyo;
+			path = "Audiyo macOS 26";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -32,7 +32,7 @@
 		D4E208202EEB5BFB00E518F7 = {
 			isa = PBXGroup;
 			children = (
-				D4E2082B2EEB5BFB00E518F7 /* Audiyo */,
+				D4E2082B2EEB5BFB00E518F7 /* Audiyo macOS 26 */,
 				D4E2082A2EEB5BFB00E518F7 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -40,7 +40,7 @@
 		D4E2082A2EEB5BFB00E518F7 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				D4E208292EEB5BFB00E518F7 /* Audiyo.app */,
+				D4E208292EEB5BFB00E518F7 /* Audiyo macOS 26.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -48,9 +48,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		D4E208282EEB5BFB00E518F7 /* Audiyo */ = {
+		D4E208282EEB5BFB00E518F7 /* Audiyo macOS 26 */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = D4E208342EEB5BFC00E518F7 /* Build configuration list for PBXNativeTarget "Audiyo" */;
+			buildConfigurationList = D4E208342EEB5BFC00E518F7 /* Build configuration list for PBXNativeTarget "Audiyo macOS 26" */;
 			buildPhases = (
 				D4E208252EEB5BFB00E518F7 /* Sources */,
 				D4E208262EEB5BFB00E518F7 /* Frameworks */,
@@ -61,13 +61,13 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				D4E2082B2EEB5BFB00E518F7 /* Audiyo */,
+				D4E2082B2EEB5BFB00E518F7 /* Audiyo macOS 26 */,
 			);
-			name = Audiyo;
+			name = "Audiyo macOS 26";
 			packageProductDependencies = (
 			);
 			productName = Audiyo;
-			productReference = D4E208292EEB5BFB00E518F7 /* Audiyo.app */;
+			productReference = D4E208292EEB5BFB00E518F7 /* Audiyo macOS 26.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -85,7 +85,7 @@
 					};
 				};
 			};
-			buildConfigurationList = D4E208242EEB5BFB00E518F7 /* Build configuration list for PBXProject "Audiyo" */;
+			buildConfigurationList = D4E208242EEB5BFB00E518F7 /* Build configuration list for PBXProject "Audiyo macOS 26" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -99,7 +99,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				D4E208282EEB5BFB00E518F7 /* Audiyo */,
+				D4E208282EEB5BFB00E518F7 /* Audiyo macOS 26 */,
 			);
 		};
 /* End PBXProject section */
@@ -258,14 +258,14 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Audiyo v1.6";
+				INFOPLIST_KEY_CFBundleDisplayName = "Audiyo v1.8";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.6;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = bdimaio.Audiyo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -291,14 +291,14 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "Audiyo v1.6";
+				INFOPLIST_KEY_CFBundleDisplayName = "Audiyo v1.8";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.music";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.6;
+				MARKETING_VERSION = 1.8;
 				PRODUCT_BUNDLE_IDENTIFIER = bdimaio.Audiyo;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -314,7 +314,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		D4E208242EEB5BFB00E518F7 /* Build configuration list for PBXProject "Audiyo" */ = {
+		D4E208242EEB5BFB00E518F7 /* Build configuration list for PBXProject "Audiyo macOS 26" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				D4E208322EEB5BFC00E518F7 /* Debug */,
@@ -323,7 +323,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		D4E208342EEB5BFC00E518F7 /* Build configuration list for PBXNativeTarget "Audiyo" */ = {
+		D4E208342EEB5BFC00E518F7 /* Build configuration list for PBXNativeTarget "Audiyo macOS 26" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				D4E208352EEB5BFC00E518F7 /* Debug */,

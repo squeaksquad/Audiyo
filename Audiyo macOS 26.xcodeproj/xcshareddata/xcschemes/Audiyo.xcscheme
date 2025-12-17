@@ -45,11 +45,20 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "D4E208282EEB5BFB00E518F7"
+            BuildableName = "Audiyo macOS 26.app"
+            BlueprintName = "Audiyo macOS 26"
+            ReferencedContainer = "container:Audiyo macOS 26.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+      <MacroExpansion>
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "D4E208282EEB5BFB00E518F7"
             BuildableName = "Audiyo.app"
             BlueprintName = "Audiyo"
             ReferencedContainer = "container:Audiyo.xcodeproj">
          </BuildableReference>
-      </BuildableProductRunnable>
+      </MacroExpansion>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
@@ -67,6 +76,15 @@
             ReferencedContainer = "container:Audiyo.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
+      <MacroExpansion>
+         <BuildableReference
+            BuildableIdentifier = "primary"
+            BlueprintIdentifier = "D4E208282EEB5BFB00E518F7"
+            BuildableName = "Audiyo.app"
+            BlueprintName = "Audiyo"
+            ReferencedContainer = "container:Audiyo.xcodeproj">
+         </BuildableReference>
+      </MacroExpansion>
    </ProfileAction>
    <AnalyzeAction
       buildConfiguration = "Debug">
