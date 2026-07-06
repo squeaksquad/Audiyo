@@ -26,22 +26,22 @@ class Track: Identifiable {
     let url: URL
     let file: AVAudioFile
     let sampleRate: Double
-    // Hardware-format buffer with the stem folded into this track's channel,
-    // built once at load. Playback schedules zero-copy slices of it, so it
-    // must stay alive for the whole time the song is loaded.
-    let routedBuffer: AVAudioPCMBuffer
+    // The stem folded to mono once at load. Play-time slices copy from this
+    // into the track's hardware output channel; storing mono keeps per-track
+    // memory at 1x the audio length regardless of device channel count.
+    let monoBuffer: AVAudioPCMBuffer
 
     var name: String { url.deletingPathExtension().lastPathComponent }
 
     var volume: Float = 1.0
     var meterLevel: Float = -100.0
 
-    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, routedBuffer: AVAudioPCMBuffer) {
+    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, monoBuffer: AVAudioPCMBuffer) {
         self.id = id
         self.url = url
         self.file = file
         self.sampleRate = sampleRate
-        self.routedBuffer = routedBuffer
+        self.monoBuffer = monoBuffer
     }
     
     var sampleRateString: String {
@@ -217,11 +217,11 @@ class AudioPlayer {
                 guard let fileBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
                 try file.read(into: fileBuffer)
 
-                // Route once at load: fold the stem into channel `index` of a
-                // hardware-format buffer. Playback schedules zero-copy slices
-                // of this buffer, so play/seek never copies audio again.
-                guard let routed = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
-                copySlice(from: fileBuffer, to: routed, startFrame: 0, frameCount: AVAudioFrameCount(maxLength), targetChannel: index)
+                // Fold the stem to mono once at load; the file-format buffer
+                // is discarded after this.
+                guard let monoFormat = AVAudioFormat(standardFormatWithSampleRate: hwFormat.sampleRate, channels: 1),
+                      let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
+                copySlice(from: fileBuffer, to: mono, startFrame: 0, frameCount: AVAudioFrameCount(file.length), targetChannel: 0)
 
                 let player = AVAudioPlayerNode()
                 let vol = savedVolumes[index] ?? 1.0
@@ -231,7 +231,7 @@ class AudioPlayer {
                 engine.connect(player, to: mainMixer, format: hwFormat)
                 players.append(player)
 
-                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, routedBuffer: routed)
+                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, monoBuffer: mono)
                 trackObj.volume = vol
                 tracks.append(trackObj)
 
@@ -270,24 +270,24 @@ class AudioPlayer {
         // Pass 1: schedule every player's buffers before any player is armed,
         // so scheduling time can't eat into the shared start deadline.
         for (i, player) in players.enumerated() {
-            let routed = tracks[i].routedBuffer
+            let mono = tracks[i].monoBuffer
 
             if shouldLoop {
                 let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
 
                 let introLen = loopEndFrame - startFrame
-                if introLen > 0, let intro = sliceBuffer(of: routed, from: startFrame, frameCount: AVAudioFrameCount(introLen)) {
+                if introLen > 0, let intro = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i) {
                     player.scheduleBuffer(intro, at: nil, options: [], completionHandler: nil)
                 }
 
                 let loopLen = loopEndFrame - loopStartFrame
-                if loopLen > 0, let loop = sliceBuffer(of: routed, from: loopStartFrame, frameCount: AVAudioFrameCount(loopLen)) {
+                if loopLen > 0, let loop = makeSlice(from: mono, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i) {
                     player.scheduleBuffer(loop, at: nil, options: .loops, completionHandler: nil)
                 }
 
             } else {
                 let length = audioLengthSamples - startFrame
-                if length > 0, let tail = sliceBuffer(of: routed, from: startFrame, frameCount: AVAudioFrameCount(length)) {
+                if length > 0, let tail = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: i) {
                     if i == 0 {
                         // One end-of-song signal is enough; the generation
                         // check drops callbacks from superseded schedules
@@ -361,23 +361,17 @@ class AudioPlayer {
         }
     }
 
-    // Wraps a sub-range of `buffer` without copying any audio. The result
-    // references `buffer`'s memory, so `buffer` must outlive it — tracks hold
-    // their routed buffers for as long as the song is loaded.
-    private func sliceBuffer(of buffer: AVAudioPCMBuffer, from startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount) -> AVAudioPCMBuffer? {
-        guard frameCount > 0, startFrame >= 0,
-              startFrame + AVAudioFramePosition(frameCount) <= AVAudioFramePosition(buffer.frameLength),
-              let src = buffer.floatChannelData else { return nil }
-        let channelCount = Int(buffer.format.channelCount)
-        let abl = AudioBufferList.allocate(maximumBuffers: channelCount)
-        for ch in 0..<channelCount {
-            abl[ch] = AudioBuffer(mNumberChannels: 1,
-                                  mDataByteSize: frameCount * UInt32(MemoryLayout<Float>.size),
-                                  mData: UnsafeMutableRawPointer(src[ch].advanced(by: Int(startFrame))))
-        }
-        return AVAudioPCMBuffer(pcmFormat: buffer.format, bufferListNoCopy: abl.unsafePointer) { ptr in
-            free(UnsafeMutableRawPointer(mutating: ptr))
-        }
+    // Builds a freshly allocated hardware-format buffer covering the given
+    // range, with the mono source copied into the track's channel. AVFAudio
+    // owns the result outright and frees it when playback is done — slices
+    // must NOT alias another buffer's memory (AVAudioPCMBuffer with
+    // bufferListNoCopy pointing into a shared allocation crashes in
+    // -[AVAudioBuffer dealloc] on macOS 26; see IMPLEMENTATION_PLAN.md).
+    private func makeSlice(from source: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount, targetChannel: Int) -> AVAudioPCMBuffer? {
+        guard let hwFormat = self.hardwareFormat, frameCount > 0,
+              let slice = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: frameCount) else { return nil }
+        copySlice(from: source, to: slice, startFrame: startFrame, frameCount: frameCount, targetChannel: targetChannel)
+        return slice
     }
     
     // MARK: - Visual Timer
