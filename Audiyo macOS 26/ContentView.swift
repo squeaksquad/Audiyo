@@ -4,6 +4,7 @@ import CoreAudio
 import AudioToolbox
 import Observation
 import Accelerate
+import Security
 
 // MARK: - 1. Data Models
 
@@ -35,6 +36,9 @@ class Track: Identifiable {
 
     var volume: Float = 1.0
     var meterLevel: Float = -100.0
+    // Shorter stems pad with silence to the longest stem's length; the UI
+    // surfaces this so students notice the mismatch.
+    var isShorterThanSong = false
 
     init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, monoBuffer: AVAudioPCMBuffer) {
         self.id = id
@@ -106,12 +110,15 @@ class AudioPlayer {
     
     private let kSavedDeviceName = "SavedAudioDeviceName"
     private let kSavedLibraryBookmark = "SavedLibraryBookmark"
-    
+
+    private var configChangeWork: DispatchWorkItem?
+
     init() {
         setupEngine()
         fetchDevices()
         restoreSavedDevice()
-        
+        observeHardwareChanges()
+
         if restoreLastLibrary() { return }
         if loadHomeDirectoryLibrary() { return }
         if loadStandardMusicLibrary() { return }
@@ -123,13 +130,13 @@ class AudioPlayer {
         var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
         var dataSize: UInt32 = 0
         AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &dataSize)
-        let bufferListPointer = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(dataSize))
-        defer { bufferListPointer.deallocate() }
-        AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, bufferListPointer)
-        var bufferList = bufferListPointer.pointee
+        guard dataSize >= UInt32(MemoryLayout<AudioBufferList>.size) else { return 2 }
+        let rawPointer = UnsafeMutableRawPointer.allocate(byteCount: Int(dataSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { rawPointer.deallocate() }
+        let listPointer = rawPointer.bindMemory(to: AudioBufferList.self, capacity: 1)
+        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, listPointer) == noErr else { return 2 }
         var totalChannels = 0
-        let buffers = UnsafeBufferPointer<AudioBuffer>(start: &bufferList.mBuffers, count: Int(bufferList.mNumberBuffers))
-        for buffer in buffers { totalChannels += Int(buffer.mNumberChannels) }
+        for buffer in UnsafeMutableAudioBufferListPointer(listPointer) { totalChannels += Int(buffer.mNumberChannels) }
         return totalChannels > 0 ? totalChannels : 2
     }
     
@@ -233,6 +240,7 @@ class AudioPlayer {
 
                 let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, monoBuffer: mono)
                 trackObj.volume = vol
+                trackObj.isShorterThanSong = file.length < maxLength
                 tracks.append(trackObj)
 
                 let throttle = MeterThrottle()
@@ -531,30 +539,30 @@ class AudioPlayer {
         }
     }
     
+    // Plain bookmarks: the app is not sandboxed, so security-scoped access
+    // is unnecessary. Revisit if App Store sandboxing is ever adopted.
     private func saveBookmark(for url: URL) {
         do {
-            let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            let data = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             UserDefaults.standard.set(data, forKey: kSavedLibraryBookmark)
         } catch { print("Failed to save bookmark: \(error)") }
     }
-    
+
     private func restoreLastLibrary() -> Bool {
         guard let data = UserDefaults.standard.data(forKey: kSavedLibraryBookmark) else { return false }
         var isStale = false
         do {
-            let url = try URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
+            let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale)
             if isStale { saveBookmark(for: url) }
-            if url.startAccessingSecurityScopedResource() {
-                scanAndSetLibrary(at: url)
-                return true
-            }
+            scanAndSetLibrary(at: url)
+            return true
         } catch { print("Failed to restore bookmark: \(error)") }
         return false
     }
     
     private func scanAndSetLibrary(at url: URL) {
         Task.detached(priority: .userInitiated) {
-            let items = await self.scanDirectory(at: url)
+            let items = self.scanDirectory(at: url)
             await MainActor.run {
                 self.libraryRoot = items
             }
@@ -596,6 +604,54 @@ class AudioPlayer {
         } catch { self.errorMessage = "Failed: \(error.localizedDescription)"; self.showError = true }
     }
     
+    // MARK: - Hardware Change Handling
+    private func observeHardwareChanges() {
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleConfigChangeHandling() }
+        }
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.handleDeviceListChange() }
+        }
+    }
+
+    // Config-change notifications arrive in bursts during device transitions;
+    // debounce so the engine rebuilds once, after the hardware settles.
+    private func scheduleConfigChangeHandling() {
+        configChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.handleConfigurationChange() }
+        }
+        configChangeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func handleConfigurationChange() {
+        // Our own rebuilds also post this notification; if the engine is
+        // running and the format still matches, there is nothing to do.
+        let currentFormat = engine.outputNode.outputFormat(forBus: 0)
+        if engine.isRunning, let hw = hardwareFormat,
+           currentFormat.sampleRate == hw.sampleRate,
+           currentFormat.channelCount == hw.channelCount { return }
+
+        let wasPlaying = isPlaying
+        let progress = playbackProgress
+        refreshHardwareState()
+        playbackProgress = progress
+        updateTimeLabel(progress: progress)
+        if wasPlaying { play(from: progress) }
+    }
+
+    private func handleDeviceListChange() {
+        let current = selectedDeviceID
+        fetchDevices()
+        if devices.contains(where: { $0.id == current }) { return }
+        if let first = devices.first {
+            selectedDeviceID = first.id
+            setOutputDevice(id: first.id)
+        }
+    }
+
     private func restoreSavedDevice() {
         if let savedName = UserDefaults.standard.string(forKey: kSavedDeviceName) {
             if let matchingDevice = devices.first(where: { $0.name == savedName }) {
@@ -635,11 +691,13 @@ class AudioPlayer {
             var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioDevicePropertyScopeOutput, mElement: 0)
             AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size)
             guard size > 0 else { return nil }
-            var name: CFString? = nil
-            var propsize = UInt32(MemoryLayout<CFString?>.size)
+            var nameRef: Unmanaged<CFString>?
+            var propsize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
             var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
-            let result = AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &propsize, &name)
-            if result == noErr, let validName = name { return AudioDevice(id: id, name: String(validName)) }
+            let result = withUnsafeMutablePointer(to: &nameRef) { ptr in
+                AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &propsize, ptr)
+            }
+            if result == noErr, let validName = nameRef?.takeRetainedValue() { return AudioDevice(id: id, name: String(validName)) }
             return nil
         }
         if selectedDeviceID == 0, let first = devices.first { selectedDeviceID = first.id }
@@ -679,6 +737,12 @@ struct TrackRow: View {
             }
             .frame(minWidth: 100, maxWidth: .infinity, alignment: .leading)
             
+            if track.isShorterThanSong {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .help("This stem is shorter than the longest stem in the song; the difference plays as silence.")
+            }
+
             Text(track.sampleRateString)
                 .font(.caption)
                 .foregroundColor(.gray)
@@ -726,32 +790,21 @@ struct ShortcutsView: View {
     }
 }
 
-struct PasswordPromptView: View {
-    @Binding var isPresented: Bool
-    var onSuccess: () -> Void
-    @State private var password = ""
-    @State private var shake = 0
-    private let adminPassword = "the Cake is a Lie"
-    
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Admin Access").font(.headline)
-            Text("Enter password to change library location.").font(.caption).foregroundColor(.secondary)
-            SecureField("Password", text: $password)
-                .frame(width: 200).textFieldStyle(RoundedBorderTextFieldStyle()).onSubmit { checkPassword() }
-            HStack {
-                Button("Cancel") { isPresented = false }.keyboardShortcut(.cancelAction)
-                Button("Unlock") { checkPassword() }.keyboardShortcut(.defaultAction)
-            }
-        }.padding().frame(width: 300, height: 180).modifier(ShakeEffect(animatableData: CGFloat(shake)))
-    }
-    func checkPassword() { if password == adminPassword { isPresented = false; onSuccess() } else { withAnimation(.default) { shake += 1 }; password = "" } }
-}
-
-struct ShakeEffect: GeometryEffect {
-    var animatableData: CGFloat
-    func effectValue(size: CGSize) -> ProjectionTransform {
-        ProjectionTransform(CGAffineTransform(translationX: 10 * sin(animatableData * .pi * 2), y: 0))
+// Gates the library-location change behind the standard macOS credential
+// dialog, requiring a user in the admin group. No secret ships in the app;
+// standard (student) accounts cannot pass even with their own password.
+private nonisolated func authenticateAsAdmin() -> Bool {
+    var authRef: AuthorizationRef?
+    guard AuthorizationCreate(nil, nil, [], &authRef) == errAuthorizationSuccess,
+          let auth = authRef else { return false }
+    defer { AuthorizationFree(auth, [.destroyRights]) }
+    return "system.privilege.admin".withCString { name in
+        var item = AuthorizationItem(name: name, valueLength: 0, value: nil, flags: 0)
+        return withUnsafeMutablePointer(to: &item) { itemPtr in
+            var rights = AuthorizationRights(count: 1, items: itemPtr)
+            let flags: AuthorizationFlags = [.interactionAllowed, .extendRights]
+            return AuthorizationCopyRights(auth, &rights, nil, flags, nil) == errAuthorizationSuccess
+        }
     }
 }
 
@@ -824,8 +877,18 @@ struct ContentView: View {
     @State private var player = AudioPlayer()
     
     @State private var showShortcuts = false
-    @State private var showPasswordPrompt = false
-    
+
+    private func unlockLibraryFolder() {
+        let player = self.player
+        Task.detached {
+            // AuthorizationCopyRights blocks on the credential dialog;
+            // keep it off the main thread.
+            if authenticateAsAdmin() {
+                await MainActor.run { player.loadLibraryFolder() }
+            }
+        }
+    }
+
     var body: some View {
         HSplitView {
             VStack(spacing: 0) {
@@ -843,7 +906,7 @@ struct ContentView: View {
                     .foregroundColor(item.isPlayable ? .primary : .secondary)
                 }
                 Divider()
-                Button(action: { showPasswordPrompt = true }) {
+                Button(action: unlockLibraryFolder) {
                     HStack { Image(systemName: "lock.fill"); Text("Load Library Folder") }.frame(maxWidth: .infinity).padding(10)
                 }.buttonStyle(.borderless).background(Color(nsColor: .controlBackgroundColor))
             }.frame(minWidth: 250, maxWidth: 350)
@@ -887,7 +950,7 @@ struct ContentView: View {
                         
                         Toggle("Loop", isOn: $player.isLooping)
                             .toggleStyle(.switch)
-                            .onChange(of: player.isLooping) { _ in player.restartIfPlaying() }
+                            .onChange(of: player.isLooping) { player.restartIfPlaying() }
                     }
                     
                     Spacer()
@@ -931,7 +994,7 @@ struct ContentView: View {
                             }
                             .labelsHidden()
                             .frame(width: 200)
-                            .onChange(of: player.selectedDeviceID) { _ in player.setOutputDevice(id: player.selectedDeviceID) }
+                            .onChange(of: player.selectedDeviceID) { player.setOutputDevice(id: player.selectedDeviceID) }
                             
                             Button(action: { player.refreshHardwareState() }) {
                                 Image(systemName: "arrow.clockwise")
@@ -990,11 +1053,6 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showPasswordPrompt) {
-            PasswordPromptView(isPresented: $showPasswordPrompt, onSuccess: {
-                player.loadLibraryFolder()
-            })
-        }
         .onAppear { player.refreshHardwareState() }
     }
 }

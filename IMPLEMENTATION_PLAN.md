@@ -110,7 +110,7 @@ Verify after this change: play, pause/resume, seek, loop with intro segment, loo
 
 ## Phase 3 — Robustness & admin auth
 
-### 3.1 `[ ]` Replace the hardcoded password with macOS admin authentication
+### 3.1 `[x]` Replace the hardcoded password with macOS admin authentication
 
 **Problem:** `PasswordPromptView` compares against a plaintext literal (`"the Cake is a Lie"`) baked into the binary. The password only gates the "Load Library Folder" button (changing the library location); it grants no filesystem access.
 
@@ -137,17 +137,17 @@ Notes for the implementer:
 - On success, call the existing `player.loadLibraryFolder()`. Delete `PasswordPromptView` and `ShakeEffect`, and remove the `showPasswordPrompt` sheet from `ContentView` — the lock button calls the auth function directly.
 - `system.privilege.admin` uses the built-in `authenticate-admin` rule. Do **not** pre-authorize anything with the granted right; it's used purely as an "is this an admin?" check, and the rights are destroyed immediately.
 
-### 3.2 `[ ]` Survive device/configuration changes automatically
+### 3.2 `[x]` Survive device/configuration changes automatically
 
 - Observe `Notification.Name.AVAudioEngineConfigurationChange` on the engine: on fire, capture transport state (progress, isPlaying, loop state, volumes), rebuild via the existing `refreshHardwareState()` path, and restore state (resume playback from captured progress if it was playing).
 - Add CoreAudio property listeners (`AudioObjectAddPropertyListenerBlock` on `kAudioObjectSystemObject`) for `kAudioHardwarePropertyDevices` (device list changed → re-run `fetchDevices`, keep selection if still present) and `kAudioHardwarePropertyDefaultOutputDevice`.
 - Keep the manual refresh button as a fallback.
 
-### 3.3 `[ ]` Simplify bookmark persistence
+### 3.3 `[x]` Simplify bookmark persistence
 
 The app is not sandboxed, so the security-scoped bookmark options in `saveBookmark`/`restoreLastLibrary` (`.withSecurityScope`, `startAccessingSecurityScopedResource`) are dead weight. Replace with a plain bookmark (no options) or just the stored path. If App Store sandboxing is ever planned, keep the scoped version instead and add the entitlement — decide then, note the decision here.
 
-### 3.4 `[ ]` Surface unequal stem lengths in the UI
+### 3.4 `[x]` Surface unequal stem lengths in the UI
 
 After 1.3, shorter stems pad with silence. Add a small per-track indicator (e.g., duration text in `TrackRow` turns orange with a tooltip) when a stem's length differs from the longest — consistent with the app's "show students the problem" philosophy.
 
@@ -170,4 +170,7 @@ After 1.3, shorter stems pad with silence. Add a small per-track indicator (e.g.
 - 2026-07-06 — Phase 1 (1.1–1.4) implemented in `ContentView.swift` on branch `sync-overhaul`. Builds clean (only pre-existing warnings remain: dangling `UnsafeBufferPointer` in `getDeviceOutputChannelCount`, CFString pointer in `fetchDevices`, deprecated `onChange` — fold into Phase 3). Manual audio verification (phase-cancellation test, short-stem test, latency check) NOT yet run — do this before calling Phase 1 complete against the verification checklist.
 - 2026-07-06 — Git history rewrite completed (separate session): .git shrank 11GB → 4.3MB, all SHAs changed, `.gitignore` for build products added. Tag and branches survived.
 - 2026-07-06 — Phase 2 (2.1–2.4) implemented on `sync-overhaul`, initially with zero-copy `bufferListNoCopy` slices. End detection: `.dataPlayedBack` completion on player 0's tail buffer guarded by a `scheduleGeneration` counter (poll kept as backstop). Timer runs in `.common` mode. Scrubbing is visual-only until gesture end (`previewSeek`/`isScrubbing`). Meters use `vDSP_rmsqv` with throttling before the main-actor hop (`MeterThrottle`, `nonisolated(unsafe)` because the project uses default-MainActor isolation).
-- 2026-07-06 — CRASH FIX: the zero-copy slices SIGABRT'd in Release (libmalloc abort in `-[AVAudioBuffer dealloc]` freeing an interior pointer — see rewritten 2.1(2) for details). Replaced with 2.1(3): `Track.monoBuffer` (stem folded to mono at load) + `makeSlice` allocating fresh hardware-format slices per transport action. Net memory is now better than the original zero-copy design (1× mono per track persistent, slices transient). Release build clean; manual verification of Phases 1+2 still pending.
+- 2026-07-06 — CRASH FIX: the zero-copy slices SIGABRT'd in Release (libmalloc abort in `-[AVAudioBuffer dealloc]` freeing an interior pointer — see rewritten 2.1(2) for details). Replaced with 2.1(3): `Track.monoBuffer` (stem folded to mono at load) + `makeSlice` allocating fresh hardware-format slices per transport action. Net memory is now better than the original zero-copy design (1× mono per track persistent, slices transient). Release build clean.
+- 2026-07-06 — User verified Phases 1+2 by running the app: playback, seek, and the previously-crashing scrub-while-playing all work.
+- 2026-07-06 — Phase 3 (3.1–3.4) implemented on `sync-overhaul`. 3.1: `PasswordPromptView`/`ShakeEffect` deleted; `authenticateAsAdmin()` (Authorization Services, `system.privilege.admin`) runs on a detached task and gates `loadLibraryFolder()`. 3.2: `.AVAudioEngineConfigurationChange` observer (0.3 s debounce, skips self-inflicted rebuilds by comparing the live output format to `hardwareFormat`) + `kAudioHardwarePropertyDevices` listener that re-fetches the device list and falls back to the first device if the selected one vanished. 3.3: bookmarks no longer security-scoped. 3.4: orange warning triangle with tooltip in `TrackRow` for stems shorter than the song. Also fixed all five pre-existing compiler warnings (dangling `UnsafeBufferPointer` in `getDeviceOutputChannelCount`, `Unmanaged<CFString>` handling in `fetchDevices`, spurious `await` in `scanAndSetLibrary`, 2× deprecated `onChange`). Build is now warning-free. Note seen in console during testing: `HALC_ProxyIOContext StartIO error 35` — transient CoreAudio start failure during rapid engine restarts; the 3.2 debounce should reduce occurrences, keep an eye on it.
+- 2026-07-06 — Remaining before calling the whole effort done: the verification checklist (phase-cancellation test, short-stem, device-swap, admin-gate checks).
