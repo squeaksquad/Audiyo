@@ -3,6 +3,8 @@ import AVFoundation
 import CoreAudio
 import AudioToolbox
 import Observation
+import Accelerate
+import Security
 
 // MARK: - 1. Data Models
 
@@ -25,29 +27,36 @@ class Track: Identifiable {
     let url: URL
     let file: AVAudioFile
     let sampleRate: Double
-    let originalBuffer: AVAudioPCMBuffer
-    let scratchBuffer: AVAudioPCMBuffer
-    let scratchLoopBuffer: AVAudioPCMBuffer
-    
+    // The stem folded to mono once at load. Play-time slices copy from this
+    // into the track's hardware output channel; storing mono keeps per-track
+    // memory at 1x the audio length regardless of device channel count.
+    let monoBuffer: AVAudioPCMBuffer
+
     var name: String { url.deletingPathExtension().lastPathComponent }
-    
+
     var volume: Float = 1.0
     var meterLevel: Float = -100.0
-    var lastUpdate: TimeInterval = 0
-    
-    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, originalBuffer: AVAudioPCMBuffer, scratchBuffer: AVAudioPCMBuffer, scratchLoopBuffer: AVAudioPCMBuffer) {
+    // Shorter stems pad with silence to the longest stem's length; the UI
+    // surfaces this so students notice the mismatch.
+    var isShorterThanSong = false
+
+    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, monoBuffer: AVAudioPCMBuffer) {
         self.id = id
         self.url = url
         self.file = file
         self.sampleRate = sampleRate
-        self.originalBuffer = originalBuffer
-        self.scratchBuffer = scratchBuffer
-        self.scratchLoopBuffer = scratchLoopBuffer
+        self.monoBuffer = monoBuffer
     }
     
     var sampleRateString: String {
         return String(format: "%.0f Hz", sampleRate)
     }
+}
+
+// Tap callbacks for one player arrive serially on its render tap thread,
+// so unsynchronized access is safe.
+private final class MeterThrottle: @unchecked Sendable {
+    nonisolated(unsafe) var lastEmit: CFTimeInterval = 0
 }
 
 // MARK: - 2. Audio Engine
@@ -88,18 +97,28 @@ class AudioPlayer {
     
     private var currentStartFrame: AVAudioFramePosition = 0
     private var currentEndFrame: AVAudioFramePosition = 0
+
+    // Invalidates completion callbacks from schedules that a later
+    // stop/seek/play has superseded.
+    private var scheduleGeneration = 0
+    // While the user drags the timeline, only the visual playhead moves;
+    // the real seek happens on gesture end.
+    private var isScrubbing = false
     
     private var hardwareFormat: AVAudioFormat?
     private var currentURLs: [URL] = []
     
     private let kSavedDeviceName = "SavedAudioDeviceName"
     private let kSavedLibraryBookmark = "SavedLibraryBookmark"
-    
+
+    private var configChangeWork: DispatchWorkItem?
+
     init() {
         setupEngine()
         fetchDevices()
         restoreSavedDevice()
-        
+        observeHardwareChanges()
+
         if restoreLastLibrary() { return }
         if loadHomeDirectoryLibrary() { return }
         if loadStandardMusicLibrary() { return }
@@ -111,13 +130,13 @@ class AudioPlayer {
         var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
         var dataSize: UInt32 = 0
         AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &dataSize)
-        let bufferListPointer = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(dataSize))
-        defer { bufferListPointer.deallocate() }
-        AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, bufferListPointer)
-        var bufferList = bufferListPointer.pointee
+        guard dataSize >= UInt32(MemoryLayout<AudioBufferList>.size) else { return 2 }
+        let rawPointer = UnsafeMutableRawPointer.allocate(byteCount: Int(dataSize), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { rawPointer.deallocate() }
+        let listPointer = rawPointer.bindMemory(to: AudioBufferList.self, capacity: 1)
+        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, listPointer) == noErr else { return 2 }
         var totalChannels = 0
-        let buffers = UnsafeBufferPointer<AudioBuffer>(start: &bufferList.mBuffers, count: Int(bufferList.mNumberBuffers))
-        for buffer in buffers { totalChannels += Int(buffer.mNumberChannels) }
+        for buffer in UnsafeMutableAudioBufferListPointer(listPointer) { totalChannels += Int(buffer.mNumberChannels) }
         return totalChannels > 0 ? totalChannels : 2
     }
     
@@ -168,43 +187,66 @@ class AudioPlayer {
         
         let hardwareLimit = Int(hwFormat.channelCount)
         let filesToLoad = self.currentURLs.prefix(hardwareLimit)
-        
-        for (index, url) in filesToLoad.enumerated() {
+
+        // Open every file before allocating anything: duration, loop math, and
+        // scratch buffer capacity must all use the longest stem, so that every
+        // player schedules identical-length buffers (shorter stems pad with
+        // silence). Unequal scheduled lengths would break loop sync.
+        var loadedFiles: [(url: URL, file: AVAudioFile)] = []
+        for url in filesToLoad {
             do {
-                let file = try AVAudioFile(forReading: url)
-                let sr = file.processingFormat.sampleRate
-                
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                try file.read(into: buffer)
-                guard let scratch = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                guard let scratchLoop = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                
-                if index == 0 {
-                    self.audioLengthSamples = file.length
-                    self.audioSampleRate = sr
-                    self.totalDuration = Double(audioLengthSamples) / audioSampleRate
-                    
-                    if abs(hwFormat.sampleRate - sr) > 1.0 {
-                        self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(sr))Hz"
-                        self.showError = true
-                    }
-                }
-                
+                loadedFiles.append((url, try AVAudioFile(forReading: url)))
+            } catch {
+                self.errorMessage = "Error: \(error.localizedDescription)"
+                self.showError = true
+            }
+        }
+        guard let firstFile = loadedFiles.first?.file else { return }
+        let maxLength = loadedFiles.map { $0.file.length }.max() ?? 0
+        guard maxLength > 0 else { return }
+
+        self.audioLengthSamples = maxLength
+        self.audioSampleRate = firstFile.processingFormat.sampleRate
+        self.totalDuration = Double(maxLength) / audioSampleRate
+
+        // Intentionally no sample-rate conversion: mismatched clocking is a
+        // teaching moment. Warn and play at the wrong rate.
+        if abs(hwFormat.sampleRate - audioSampleRate) > 1.0 {
+            self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(audioSampleRate))Hz"
+            self.showError = true
+        }
+
+        for (index, loaded) in loadedFiles.enumerated() {
+            let url = loaded.url
+            let file = loaded.file
+            let sr = file.processingFormat.sampleRate
+            do {
+                guard let fileBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
+                try file.read(into: fileBuffer)
+
+                // Fold the stem to mono once at load; the file-format buffer
+                // is discarded after this.
+                guard let monoFormat = AVAudioFormat(standardFormatWithSampleRate: hwFormat.sampleRate, channels: 1),
+                      let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
+                copySlice(from: fileBuffer, to: mono, startFrame: 0, frameCount: AVAudioFrameCount(file.length), targetChannel: 0)
+
                 let player = AVAudioPlayerNode()
                 let vol = savedVolumes[index] ?? 1.0
                 player.volume = vol
-                
+
                 engine.attach(player)
                 engine.connect(player, to: mainMixer, format: hwFormat)
                 players.append(player)
-                
-                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, originalBuffer: buffer, scratchBuffer: scratch, scratchLoopBuffer: scratchLoop)
+
+                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, monoBuffer: mono)
                 trackObj.volume = vol
+                trackObj.isShorterThanSong = file.length < maxLength
                 tracks.append(trackObj)
-                
+
+                let throttle = MeterThrottle()
                 player.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] (buffer, time) in
                     guard let self = self else { return }
-                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index)
+                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index, throttle: throttle)
                 }
             } catch {
                 self.errorMessage = "Error: \(error.localizedDescription)"
@@ -229,42 +271,65 @@ class AudioPlayer {
         let shouldLoop = isLooping && startFrame < loopEndFrame
         self.currentEndFrame = shouldLoop ? loopEndFrame : audioLengthSamples
         
-        let delaySeconds = 0.02
-        let hostTime = mach_absolute_time() + UInt64(delaySeconds * 1_000_000_000)
-        let startTime = AVAudioTime(hostTime: hostTime)
-        
+        scheduleGeneration += 1
+        let generation = scheduleGeneration
         players.forEach { $0.stop() }
-        
+
+        // Pass 1: schedule every player's buffers before any player is armed,
+        // so scheduling time can't eat into the shared start deadline.
         for (i, player) in players.enumerated() {
-            let source = tracks[i].originalBuffer
-            let scratch = tracks[i].scratchBuffer
-            let scratchLoop = tracks[i].scratchLoopBuffer
-            
+            let mono = tracks[i].monoBuffer
+
             if shouldLoop {
                 let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
-                
+
                 let introLen = loopEndFrame - startFrame
-                if introLen > 0 {
-                    copySlice(from: source, to: scratch, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i)
-                    player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
+                if introLen > 0, let intro = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i) {
+                    player.scheduleBuffer(intro, at: nil, options: [], completionHandler: nil)
                 }
-                
+
                 let loopLen = loopEndFrame - loopStartFrame
-                if loopLen > 0 {
-                    copySlice(from: source, to: scratchLoop, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i)
-                    player.scheduleBuffer(scratchLoop, at: nil, options: .loops, completionHandler: nil)
+                if loopLen > 0, let loop = makeSlice(from: mono, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i) {
+                    player.scheduleBuffer(loop, at: nil, options: .loops, completionHandler: nil)
                 }
-                
+
             } else {
                 let length = audioLengthSamples - startFrame
-                if length > 0 {
-                    copySlice(from: source, to: scratch, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: i)
-                    player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
+                if length > 0, let tail = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: i) {
+                    if i == 0 {
+                        // One end-of-song signal is enough; the generation
+                        // check drops callbacks from superseded schedules
+                        // (player.stop() also fires completion handlers).
+                        player.scheduleBuffer(tail, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                            guard let self else { return }
+                            Task { @MainActor in
+                                guard self.scheduleGeneration == generation, self.isPlaying else { return }
+                                self.stop()
+                                self.playbackProgress = 0.0
+                                self.updateTimeLabel(progress: 0.0)
+                            }
+                        }
+                    } else {
+                        player.scheduleBuffer(tail, at: nil, options: [], completionHandler: nil)
+                    }
                 }
             }
-            player.play(at: startTime)
         }
-        
+
+        // Shared start time, computed only after all scheduling work is done.
+        // Anchored to the mach host clock (ticks, NOT nanoseconds on Apple
+        // Silicon — convert via hostTime(forSeconds:)). Do not anchor to
+        // outputNode.lastRenderTime sample time: the engine's sample counter
+        // resets across engine restarts (song switches, device changes) and
+        // can report a stale pre-restart value that still passes
+        // isSampleTimeValid, which starts players against the wrong epoch and
+        // desyncs the playhead math from the audio.
+        let delaySeconds = 0.05
+        let startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delaySeconds))
+
+        // Pass 2: nothing but play calls, every player gets the identical time.
+        players.forEach { $0.play(at: startTime) }
+
         self.playbackProgress = effectiveStartProgress
         isPlaying = true
         DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { self.startTimer() }
@@ -277,23 +342,60 @@ class AudioPlayer {
         for ch in 0..<destChannels {
             if let ptr = destination.floatChannelData?[ch] { memset(ptr, 0, Int(frameCount) * MemoryLayout<Float>.size) }
         }
-        if let srcBasePtr = source.floatChannelData?[0],
-           let dstPtr = destination.floatChannelData?[targetChannel] {
-            let srcOffsetPtr = srcBasePtr.advanced(by: Int(startFrame))
-            memcpy(dstPtr, srcOffsetPtr, Int(frameCount) * MemoryLayout<Float>.size)
+
+        // frameCount is sized to the longest stem; a shorter source only has
+        // `available` frames past startFrame, the rest stays silent.
+        let sourceLength = AVAudioFramePosition(source.frameLength)
+        guard startFrame >= 0, startFrame < sourceLength else { return }
+        let copyCount = min(frameCount, AVAudioFrameCount(sourceLength - startFrame))
+        guard copyCount > 0 else { return }
+
+        guard let srcChannels = source.floatChannelData,
+              let dstPtr = destination.floatChannelData?[targetChannel] else { return }
+        memcpy(dstPtr, srcChannels[0].advanced(by: Int(startFrame)), Int(copyCount) * MemoryLayout<Float>.size)
+
+        // Stems are expected to be mono; fold multi-channel sources down by
+        // averaging so no channel is silently dropped.
+        let srcChannelCount = Int(source.format.channelCount)
+        if srcChannelCount > 1 {
+            for ch in 1..<srcChannelCount {
+                vDSP_vadd(dstPtr, 1, srcChannels[ch].advanced(by: Int(startFrame)), 1, dstPtr, 1, vDSP_Length(copyCount))
+            }
+            var scale = 1.0 / Float(srcChannelCount)
+            vDSP_vsmul(dstPtr, 1, &scale, dstPtr, 1, vDSP_Length(copyCount))
         }
+    }
+
+    // Builds a freshly allocated hardware-format buffer covering the given
+    // range, with the mono source copied into the track's channel. AVFAudio
+    // owns the result outright and frees it when playback is done — slices
+    // must NOT alias another buffer's memory (AVAudioPCMBuffer with
+    // bufferListNoCopy pointing into a shared allocation crashes in
+    // -[AVAudioBuffer dealloc] on macOS 26; see IMPLEMENTATION_PLAN.md).
+    private func makeSlice(from source: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount, targetChannel: Int) -> AVAudioPCMBuffer? {
+        guard let hwFormat = self.hardwareFormat, frameCount > 0,
+              let slice = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: frameCount) else { return nil }
+        copySlice(from: source, to: slice, startFrame: startFrame, frameCount: frameCount, targetChannel: targetChannel)
+        return slice
     }
     
     // MARK: - Visual Timer
     private func startTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in self?.updateProgress() }
+        // .common mode keeps the playhead moving during menu tracking and drags.
+        let newTimer = Timer(timeInterval: 0.016, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateProgress() }
+        }
+        RunLoop.main.add(newTimer, forMode: .common)
+        timer = newTimer
     }
-    
+
     private func updateProgress() {
+        guard !isScrubbing else { return }
         guard let node = players.first, let nodeTime = node.lastRenderTime, let playerTime = node.playerTime(forNodeTime: nodeTime) else { return }
-        
-        let framesPlayed = playerTime.sampleTime
+
+        // Negative during the ~50ms arm window before the scheduled start.
+        let framesPlayed = max(0, playerTime.sampleTime)
         var absoluteFrame: AVAudioFramePosition = 0
         let loopEndFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopEnd)
         
@@ -323,7 +425,7 @@ class AudioPlayer {
     // MARK: - Controls
     func togglePlay() { if isPlaying { stop() } else { play(from: playbackProgress) } }
     func toggleLoop() { isLooping.toggle(); restartIfPlaying() }
-    func stop() { players.forEach { $0.stop() }; isPlaying = false; timer?.invalidate(); timer = nil }
+    func stop() { scheduleGeneration += 1; players.forEach { $0.stop() }; isPlaying = false; timer?.invalidate(); timer = nil }
     
     func setVolume(_ vol: Float, index: Int) {
         if index < players.count {
@@ -348,7 +450,16 @@ class AudioPlayer {
     func jumpToMarker(at index: Int) { guard let progress = markers[index] else { return }; seek(to: progress) }
     func jumpToStart() { seek(to: isLooping ? loopStart : 0.0) }
     
+    // Visual-only position update while the timeline is being dragged;
+    // audio keeps playing at its old position until seek(to:) on release.
+    func previewSeek(to progress: Double) {
+        isScrubbing = true
+        playbackProgress = progress
+        updateTimeLabel(progress: progress)
+    }
+
     func seek(to progress: Double) {
+        isScrubbing = false
         let wasPlaying = isPlaying
         stop()
         self.playbackProgress = progress
@@ -366,30 +477,23 @@ class AudioPlayer {
         return String(format: "%d:%02d", m, s)
     }
     
-    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int) {
-        guard let floatData = buffer.floatChannelData else { return }
-        if channelIndex >= Int(buffer.format.channelCount) { return }
-        
-        let channelData = floatData[channelIndex]
-        let frames = Int(buffer.frameLength)
-        var sum: Float = 0
-        let strideVal = 10
-        for i in stride(from: 0, to: frames, by: strideVal) {
-            let sample = channelData[i]
-            sum += sample * sample
-        }
-        
-        let rms = sqrt(sum / Float(frames / strideVal))
-        let avgPower = 20 * log10(rms)
-        
+    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int, throttle: MeterThrottle) {
+        // Throttle before doing any work or hopping to the main actor.
+        let now = CACurrentMediaTime()
+        guard now - throttle.lastEmit > 0.03 else { return }
+        throttle.lastEmit = now
+
+        guard let floatData = buffer.floatChannelData,
+              channelIndex < Int(buffer.format.channelCount),
+              buffer.frameLength > 0 else { return }
+
+        var rms: Float = 0
+        vDSP_rmsqv(floatData[channelIndex], 1, &rms, vDSP_Length(buffer.frameLength))
+        let avgPower = 20 * log10(max(rms, .leastNormalMagnitude))
+
         Task { @MainActor in
             guard trackIndex < self.tracks.count else { return }
-            let track = self.tracks[trackIndex]
-            let now = CACurrentMediaTime()
-            if now - track.lastUpdate > 0.03 {
-                track.meterLevel = avgPower
-                track.lastUpdate = now
-            }
+            self.tracks[trackIndex].meterLevel = avgPower
         }
     }
     
@@ -433,30 +537,30 @@ class AudioPlayer {
         }
     }
     
+    // Plain bookmarks: the app is not sandboxed, so security-scoped access
+    // is unnecessary. Revisit if App Store sandboxing is ever adopted.
     private func saveBookmark(for url: URL) {
         do {
-            let data = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+            let data = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             UserDefaults.standard.set(data, forKey: kSavedLibraryBookmark)
         } catch { print("Failed to save bookmark: \(error)") }
     }
-    
+
     private func restoreLastLibrary() -> Bool {
         guard let data = UserDefaults.standard.data(forKey: kSavedLibraryBookmark) else { return false }
         var isStale = false
         do {
-            let url = try URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale)
+            let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale)
             if isStale { saveBookmark(for: url) }
-            if url.startAccessingSecurityScopedResource() {
-                scanAndSetLibrary(at: url)
-                return true
-            }
+            scanAndSetLibrary(at: url)
+            return true
         } catch { print("Failed to restore bookmark: \(error)") }
         return false
     }
     
     private func scanAndSetLibrary(at url: URL) {
         Task.detached(priority: .userInitiated) {
-            let items = await self.scanDirectory(at: url)
+            let items = self.scanDirectory(at: url)
             await MainActor.run {
                 self.libraryRoot = items
             }
@@ -498,6 +602,54 @@ class AudioPlayer {
         } catch { self.errorMessage = "Failed: \(error.localizedDescription)"; self.showError = true }
     }
     
+    // MARK: - Hardware Change Handling
+    private func observeHardwareChanges() {
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.scheduleConfigChangeHandling() }
+        }
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, DispatchQueue.main) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.handleDeviceListChange() }
+        }
+    }
+
+    // Config-change notifications arrive in bursts during device transitions;
+    // debounce so the engine rebuilds once, after the hardware settles.
+    private func scheduleConfigChangeHandling() {
+        configChangeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.handleConfigurationChange() }
+        }
+        configChangeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func handleConfigurationChange() {
+        // Our own rebuilds also post this notification; if the engine is
+        // running and the format still matches, there is nothing to do.
+        let currentFormat = engine.outputNode.outputFormat(forBus: 0)
+        if engine.isRunning, let hw = hardwareFormat,
+           currentFormat.sampleRate == hw.sampleRate,
+           currentFormat.channelCount == hw.channelCount { return }
+
+        let wasPlaying = isPlaying
+        let progress = playbackProgress
+        refreshHardwareState()
+        playbackProgress = progress
+        updateTimeLabel(progress: progress)
+        if wasPlaying { play(from: progress) }
+    }
+
+    private func handleDeviceListChange() {
+        let current = selectedDeviceID
+        fetchDevices()
+        if devices.contains(where: { $0.id == current }) { return }
+        if let first = devices.first {
+            selectedDeviceID = first.id
+            setOutputDevice(id: first.id)
+        }
+    }
+
     private func restoreSavedDevice() {
         if let savedName = UserDefaults.standard.string(forKey: kSavedDeviceName) {
             if let matchingDevice = devices.first(where: { $0.name == savedName }) {
@@ -537,11 +689,13 @@ class AudioPlayer {
             var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioDevicePropertyScopeOutput, mElement: 0)
             AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size)
             guard size > 0 else { return nil }
-            var name: CFString? = nil
-            var propsize = UInt32(MemoryLayout<CFString?>.size)
+            var nameRef: Unmanaged<CFString>?
+            var propsize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
             var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
-            let result = AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &propsize, &name)
-            if result == noErr, let validName = name { return AudioDevice(id: id, name: String(validName)) }
+            let result = withUnsafeMutablePointer(to: &nameRef) { ptr in
+                AudioObjectGetPropertyData(id, &nameAddr, 0, nil, &propsize, ptr)
+            }
+            if result == noErr, let validName = nameRef?.takeRetainedValue() { return AudioDevice(id: id, name: String(validName)) }
             return nil
         }
         if selectedDeviceID == 0, let first = devices.first { selectedDeviceID = first.id }
@@ -581,6 +735,12 @@ struct TrackRow: View {
             }
             .frame(minWidth: 100, maxWidth: .infinity, alignment: .leading)
             
+            if track.isShorterThanSong {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .help("This stem is shorter than the longest stem in the song; the difference plays as silence.")
+            }
+
             Text(track.sampleRateString)
                 .font(.caption)
                 .foregroundColor(.gray)
@@ -628,32 +788,21 @@ struct ShortcutsView: View {
     }
 }
 
-struct PasswordPromptView: View {
-    @Binding var isPresented: Bool
-    var onSuccess: () -> Void
-    @State private var password = ""
-    @State private var shake = 0
-    private let adminPassword = "the Cake is a Lie"
-    
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Admin Access").font(.headline)
-            Text("Enter password to change library location.").font(.caption).foregroundColor(.secondary)
-            SecureField("Password", text: $password)
-                .frame(width: 200).textFieldStyle(RoundedBorderTextFieldStyle()).onSubmit { checkPassword() }
-            HStack {
-                Button("Cancel") { isPresented = false }.keyboardShortcut(.cancelAction)
-                Button("Unlock") { checkPassword() }.keyboardShortcut(.defaultAction)
-            }
-        }.padding().frame(width: 300, height: 180).modifier(ShakeEffect(animatableData: CGFloat(shake)))
-    }
-    func checkPassword() { if password == adminPassword { isPresented = false; onSuccess() } else { withAnimation(.default) { shake += 1 }; password = "" } }
-}
-
-struct ShakeEffect: GeometryEffect {
-    var animatableData: CGFloat
-    func effectValue(size: CGSize) -> ProjectionTransform {
-        ProjectionTransform(CGAffineTransform(translationX: 10 * sin(animatableData * .pi * 2), y: 0))
+// Gates the library-location change behind the standard macOS credential
+// dialog, requiring a user in the admin group. No secret ships in the app;
+// standard (student) accounts cannot pass even with their own password.
+private nonisolated func authenticateAsAdmin() -> Bool {
+    var authRef: AuthorizationRef?
+    guard AuthorizationCreate(nil, nil, [], &authRef) == errAuthorizationSuccess,
+          let auth = authRef else { return false }
+    defer { AuthorizationFree(auth, [.destroyRights]) }
+    return "system.privilege.admin".withCString { name in
+        var item = AuthorizationItem(name: name, valueLength: 0, value: nil, flags: 0)
+        return withUnsafeMutablePointer(to: &item) { itemPtr in
+            var rights = AuthorizationRights(count: 1, items: itemPtr)
+            let flags: AuthorizationFlags = [.interactionAllowed, .extendRights]
+            return AuthorizationCopyRights(auth, &rights, nil, flags, nil) == errAuthorizationSuccess
+        }
     }
 }
 
@@ -676,10 +825,15 @@ struct TimelineView: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Rectangle().fill(Color.gray.opacity(0.3)).frame(height: 30).cornerRadius(4)
-                        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                            let ratio = value.location.x / geo.size.width
-                            player.seek(to: max(0.0, min(1.0, ratio)))
-                        })
+                        .gesture(DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let ratio = value.location.x / geo.size.width
+                                player.previewSeek(to: max(0.0, min(1.0, ratio)))
+                            }
+                            .onEnded { value in
+                                let ratio = value.location.x / geo.size.width
+                                player.seek(to: max(0.0, min(1.0, ratio)))
+                            })
                     
                     Rectangle().fill(Color.blue.opacity(0.2))
                         .frame(width: max(0, geo.size.width * CGFloat(player.loopEnd - player.loopStart)), height: 30)
@@ -698,17 +852,22 @@ struct TimelineView: View {
                     Rectangle().fill(Color.white).frame(width: 2, height: 30)
                         .offset(x: geo.size.width * CGFloat(player.playbackProgress)).allowsHitTesting(false)
                     
-                    Circle().fill(Color.green).frame(width: 16, height: 16)
-                        .offset(x: (geo.size.width * CGFloat(player.loopStart)) - 8)
-                        .gesture(DragGesture().onChanged { value in
-                            player.loopStart = max(0, min(player.loopEnd - 0.001, value.location.x / geo.size.width))
-                        }.onEnded { _ in player.restartIfPlaying() })
-                    
-                    Circle().fill(Color.red).frame(width: 16, height: 16)
-                        .offset(x: (geo.size.width * CGFloat(player.loopEnd)) - 8)
-                        .gesture(DragGesture().onChanged { value in
-                            player.loopEnd = min(1.0, max(player.loopStart + 0.001, value.location.x / geo.size.width))
-                        }.onEnded { _ in player.restartIfPlaying() })
+                    // Handles only exist while looping; otherwise they sit on
+                    // top of the timeline and steal seek clicks/drags that
+                    // land near them.
+                    if player.isLooping {
+                        Circle().fill(Color.green).frame(width: 16, height: 16)
+                            .offset(x: (geo.size.width * CGFloat(player.loopStart)) - 8)
+                            .gesture(DragGesture().onChanged { value in
+                                player.loopStart = max(0, min(player.loopEnd - 0.001, value.location.x / geo.size.width))
+                            }.onEnded { _ in if player.isLooping { player.restartIfPlaying() } })
+
+                        Circle().fill(Color.red).frame(width: 16, height: 16)
+                            .offset(x: (geo.size.width * CGFloat(player.loopEnd)) - 8)
+                            .gesture(DragGesture().onChanged { value in
+                                player.loopEnd = min(1.0, max(player.loopStart + 0.001, value.location.x / geo.size.width))
+                            }.onEnded { _ in if player.isLooping { player.restartIfPlaying() } })
+                    }
                 }
             }.frame(height: 30)
         }
@@ -721,8 +880,18 @@ struct ContentView: View {
     @State private var player = AudioPlayer()
     
     @State private var showShortcuts = false
-    @State private var showPasswordPrompt = false
-    
+
+    private func unlockLibraryFolder() {
+        let player = self.player
+        Task.detached {
+            // AuthorizationCopyRights blocks on the credential dialog;
+            // keep it off the main thread.
+            if authenticateAsAdmin() {
+                await MainActor.run { player.loadLibraryFolder() }
+            }
+        }
+    }
+
     var body: some View {
         HSplitView {
             VStack(spacing: 0) {
@@ -740,7 +909,7 @@ struct ContentView: View {
                     .foregroundColor(item.isPlayable ? .primary : .secondary)
                 }
                 Divider()
-                Button(action: { showPasswordPrompt = true }) {
+                Button(action: unlockLibraryFolder) {
                     HStack { Image(systemName: "lock.fill"); Text("Load Library Folder") }.frame(maxWidth: .infinity).padding(10)
                 }.buttonStyle(.borderless).background(Color(nsColor: .controlBackgroundColor))
             }.frame(minWidth: 250, maxWidth: 350)
@@ -784,7 +953,7 @@ struct ContentView: View {
                         
                         Toggle("Loop", isOn: $player.isLooping)
                             .toggleStyle(.switch)
-                            .onChange(of: player.isLooping) { _ in player.restartIfPlaying() }
+                            .onChange(of: player.isLooping) { player.restartIfPlaying() }
                     }
                     
                     Spacer()
@@ -828,7 +997,7 @@ struct ContentView: View {
                             }
                             .labelsHidden()
                             .frame(width: 200)
-                            .onChange(of: player.selectedDeviceID) { _ in player.setOutputDevice(id: player.selectedDeviceID) }
+                            .onChange(of: player.selectedDeviceID) { player.setOutputDevice(id: player.selectedDeviceID) }
                             
                             Button(action: { player.refreshHardwareState() }) {
                                 Image(systemName: "arrow.clockwise")
@@ -887,11 +1056,6 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showPasswordPrompt) {
-            PasswordPromptView(isPresented: $showPasswordPrompt, onSuccess: {
-                player.loadLibraryFolder()
-            })
-        }
         .onAppear { player.refreshHardwareState() }
     }
 }
