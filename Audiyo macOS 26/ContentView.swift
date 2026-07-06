@@ -26,29 +26,33 @@ class Track: Identifiable {
     let url: URL
     let file: AVAudioFile
     let sampleRate: Double
-    let originalBuffer: AVAudioPCMBuffer
-    let scratchBuffer: AVAudioPCMBuffer
-    let scratchLoopBuffer: AVAudioPCMBuffer
-    
+    // Hardware-format buffer with the stem folded into this track's channel,
+    // built once at load. Playback schedules zero-copy slices of it, so it
+    // must stay alive for the whole time the song is loaded.
+    let routedBuffer: AVAudioPCMBuffer
+
     var name: String { url.deletingPathExtension().lastPathComponent }
-    
+
     var volume: Float = 1.0
     var meterLevel: Float = -100.0
-    var lastUpdate: TimeInterval = 0
-    
-    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, originalBuffer: AVAudioPCMBuffer, scratchBuffer: AVAudioPCMBuffer, scratchLoopBuffer: AVAudioPCMBuffer) {
+
+    init(id: Int, url: URL, file: AVAudioFile, sampleRate: Double, routedBuffer: AVAudioPCMBuffer) {
         self.id = id
         self.url = url
         self.file = file
         self.sampleRate = sampleRate
-        self.originalBuffer = originalBuffer
-        self.scratchBuffer = scratchBuffer
-        self.scratchLoopBuffer = scratchLoopBuffer
+        self.routedBuffer = routedBuffer
     }
     
     var sampleRateString: String {
         return String(format: "%.0f Hz", sampleRate)
     }
+}
+
+// Tap callbacks for one player arrive serially on its render tap thread,
+// so unsynchronized access is safe.
+private final class MeterThrottle: @unchecked Sendable {
+    nonisolated(unsafe) var lastEmit: CFTimeInterval = 0
 }
 
 // MARK: - 2. Audio Engine
@@ -89,6 +93,13 @@ class AudioPlayer {
     
     private var currentStartFrame: AVAudioFramePosition = 0
     private var currentEndFrame: AVAudioFramePosition = 0
+
+    // Invalidates completion callbacks from schedules that a later
+    // stop/seek/play has superseded.
+    private var scheduleGeneration = 0
+    // While the user drags the timeline, only the visual playhead moves;
+    // the real seek happens on gesture end.
+    private var isScrubbing = false
     
     private var hardwareFormat: AVAudioFormat?
     private var currentURLs: [URL] = []
@@ -203,26 +214,31 @@ class AudioPlayer {
             let file = loaded.file
             let sr = file.processingFormat.sampleRate
             do {
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                try file.read(into: buffer)
-                guard let scratch = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
-                guard let scratchLoop = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
+                guard let fileBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
+                try file.read(into: fileBuffer)
+
+                // Route once at load: fold the stem into channel `index` of a
+                // hardware-format buffer. Playback schedules zero-copy slices
+                // of this buffer, so play/seek never copies audio again.
+                guard let routed = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
+                copySlice(from: fileBuffer, to: routed, startFrame: 0, frameCount: AVAudioFrameCount(maxLength), targetChannel: index)
 
                 let player = AVAudioPlayerNode()
                 let vol = savedVolumes[index] ?? 1.0
                 player.volume = vol
-                
+
                 engine.attach(player)
                 engine.connect(player, to: mainMixer, format: hwFormat)
                 players.append(player)
-                
-                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, originalBuffer: buffer, scratchBuffer: scratch, scratchLoopBuffer: scratchLoop)
+
+                let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, routedBuffer: routed)
                 trackObj.volume = vol
                 tracks.append(trackObj)
-                
+
+                let throttle = MeterThrottle()
                 player.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] (buffer, time) in
                     guard let self = self else { return }
-                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index)
+                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index, throttle: throttle)
                 }
             } catch {
                 self.errorMessage = "Error: \(error.localizedDescription)"
@@ -247,35 +263,47 @@ class AudioPlayer {
         let shouldLoop = isLooping && startFrame < loopEndFrame
         self.currentEndFrame = shouldLoop ? loopEndFrame : audioLengthSamples
         
+        scheduleGeneration += 1
+        let generation = scheduleGeneration
         players.forEach { $0.stop() }
 
         // Pass 1: schedule every player's buffers before any player is armed,
-        // so copy time can't eat into the shared start deadline.
+        // so scheduling time can't eat into the shared start deadline.
         for (i, player) in players.enumerated() {
-            let source = tracks[i].originalBuffer
-            let scratch = tracks[i].scratchBuffer
-            let scratchLoop = tracks[i].scratchLoopBuffer
+            let routed = tracks[i].routedBuffer
 
             if shouldLoop {
                 let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
 
                 let introLen = loopEndFrame - startFrame
-                if introLen > 0 {
-                    copySlice(from: source, to: scratch, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i)
-                    player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
+                if introLen > 0, let intro = sliceBuffer(of: routed, from: startFrame, frameCount: AVAudioFrameCount(introLen)) {
+                    player.scheduleBuffer(intro, at: nil, options: [], completionHandler: nil)
                 }
 
                 let loopLen = loopEndFrame - loopStartFrame
-                if loopLen > 0 {
-                    copySlice(from: source, to: scratchLoop, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i)
-                    player.scheduleBuffer(scratchLoop, at: nil, options: .loops, completionHandler: nil)
+                if loopLen > 0, let loop = sliceBuffer(of: routed, from: loopStartFrame, frameCount: AVAudioFrameCount(loopLen)) {
+                    player.scheduleBuffer(loop, at: nil, options: .loops, completionHandler: nil)
                 }
 
             } else {
                 let length = audioLengthSamples - startFrame
-                if length > 0 {
-                    copySlice(from: source, to: scratch, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: i)
-                    player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
+                if length > 0, let tail = sliceBuffer(of: routed, from: startFrame, frameCount: AVAudioFrameCount(length)) {
+                    if i == 0 {
+                        // One end-of-song signal is enough; the generation
+                        // check drops callbacks from superseded schedules
+                        // (player.stop() also fires completion handlers).
+                        player.scheduleBuffer(tail, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                            guard let self else { return }
+                            Task { @MainActor in
+                                guard self.scheduleGeneration == generation, self.isPlaying else { return }
+                                self.stop()
+                                self.playbackProgress = 0.0
+                                self.updateTimeLabel(progress: 0.0)
+                            }
+                        }
+                    } else {
+                        player.scheduleBuffer(tail, at: nil, options: [], completionHandler: nil)
+                    }
                 }
             }
         }
@@ -332,14 +360,39 @@ class AudioPlayer {
             vDSP_vsmul(dstPtr, 1, &scale, dstPtr, 1, vDSP_Length(copyCount))
         }
     }
+
+    // Wraps a sub-range of `buffer` without copying any audio. The result
+    // references `buffer`'s memory, so `buffer` must outlive it — tracks hold
+    // their routed buffers for as long as the song is loaded.
+    private func sliceBuffer(of buffer: AVAudioPCMBuffer, from startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount) -> AVAudioPCMBuffer? {
+        guard frameCount > 0, startFrame >= 0,
+              startFrame + AVAudioFramePosition(frameCount) <= AVAudioFramePosition(buffer.frameLength),
+              let src = buffer.floatChannelData else { return nil }
+        let channelCount = Int(buffer.format.channelCount)
+        let abl = AudioBufferList.allocate(maximumBuffers: channelCount)
+        for ch in 0..<channelCount {
+            abl[ch] = AudioBuffer(mNumberChannels: 1,
+                                  mDataByteSize: frameCount * UInt32(MemoryLayout<Float>.size),
+                                  mData: UnsafeMutableRawPointer(src[ch].advanced(by: Int(startFrame))))
+        }
+        return AVAudioPCMBuffer(pcmFormat: buffer.format, bufferListNoCopy: abl.unsafePointer) { ptr in
+            free(UnsafeMutableRawPointer(mutating: ptr))
+        }
+    }
     
     // MARK: - Visual Timer
     private func startTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in self?.updateProgress() }
+        // .common mode keeps the playhead moving during menu tracking and drags.
+        let newTimer = Timer(timeInterval: 0.016, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateProgress() }
+        }
+        RunLoop.main.add(newTimer, forMode: .common)
+        timer = newTimer
     }
-    
+
     private func updateProgress() {
+        guard !isScrubbing else { return }
         guard let node = players.first, let nodeTime = node.lastRenderTime, let playerTime = node.playerTime(forNodeTime: nodeTime) else { return }
         
         let framesPlayed = playerTime.sampleTime
@@ -372,7 +425,7 @@ class AudioPlayer {
     // MARK: - Controls
     func togglePlay() { if isPlaying { stop() } else { play(from: playbackProgress) } }
     func toggleLoop() { isLooping.toggle(); restartIfPlaying() }
-    func stop() { players.forEach { $0.stop() }; isPlaying = false; timer?.invalidate(); timer = nil }
+    func stop() { scheduleGeneration += 1; players.forEach { $0.stop() }; isPlaying = false; timer?.invalidate(); timer = nil }
     
     func setVolume(_ vol: Float, index: Int) {
         if index < players.count {
@@ -397,7 +450,16 @@ class AudioPlayer {
     func jumpToMarker(at index: Int) { guard let progress = markers[index] else { return }; seek(to: progress) }
     func jumpToStart() { seek(to: isLooping ? loopStart : 0.0) }
     
+    // Visual-only position update while the timeline is being dragged;
+    // audio keeps playing at its old position until seek(to:) on release.
+    func previewSeek(to progress: Double) {
+        isScrubbing = true
+        playbackProgress = progress
+        updateTimeLabel(progress: progress)
+    }
+
     func seek(to progress: Double) {
+        isScrubbing = false
         let wasPlaying = isPlaying
         stop()
         self.playbackProgress = progress
@@ -415,30 +477,23 @@ class AudioPlayer {
         return String(format: "%d:%02d", m, s)
     }
     
-    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int) {
-        guard let floatData = buffer.floatChannelData else { return }
-        if channelIndex >= Int(buffer.format.channelCount) { return }
-        
-        let channelData = floatData[channelIndex]
-        let frames = Int(buffer.frameLength)
-        var sum: Float = 0
-        let strideVal = 10
-        for i in stride(from: 0, to: frames, by: strideVal) {
-            let sample = channelData[i]
-            sum += sample * sample
-        }
-        
-        let rms = sqrt(sum / Float(frames / strideVal))
-        let avgPower = 20 * log10(rms)
-        
+    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int, throttle: MeterThrottle) {
+        // Throttle before doing any work or hopping to the main actor.
+        let now = CACurrentMediaTime()
+        guard now - throttle.lastEmit > 0.03 else { return }
+        throttle.lastEmit = now
+
+        guard let floatData = buffer.floatChannelData,
+              channelIndex < Int(buffer.format.channelCount),
+              buffer.frameLength > 0 else { return }
+
+        var rms: Float = 0
+        vDSP_rmsqv(floatData[channelIndex], 1, &rms, vDSP_Length(buffer.frameLength))
+        let avgPower = 20 * log10(max(rms, .leastNormalMagnitude))
+
         Task { @MainActor in
             guard trackIndex < self.tracks.count else { return }
-            let track = self.tracks[trackIndex]
-            let now = CACurrentMediaTime()
-            if now - track.lastUpdate > 0.03 {
-                track.meterLevel = avgPower
-                track.lastUpdate = now
-            }
+            self.tracks[trackIndex].meterLevel = avgPower
         }
     }
     
@@ -725,10 +780,15 @@ struct TimelineView: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Rectangle().fill(Color.gray.opacity(0.3)).frame(height: 30).cornerRadius(4)
-                        .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                            let ratio = value.location.x / geo.size.width
-                            player.seek(to: max(0.0, min(1.0, ratio)))
-                        })
+                        .gesture(DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                let ratio = value.location.x / geo.size.width
+                                player.previewSeek(to: max(0.0, min(1.0, ratio)))
+                            }
+                            .onEnded { value in
+                                let ratio = value.location.x / geo.size.width
+                                player.seek(to: max(0.0, min(1.0, ratio)))
+                            })
                     
                     Rectangle().fill(Color.blue.opacity(0.2))
                         .frame(width: max(0, geo.size.width * CGFloat(player.loopEnd - player.loopStart)), height: 30)

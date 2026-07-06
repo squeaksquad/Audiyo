@@ -77,7 +77,7 @@ Keep the safety margin ≥ 50 ms; it is inaudible for a transport start and make
 
 ## Phase 2 — Efficiency (removes the CPU/memory spikes that cause glitches in practice)
 
-### 2.1 `[ ]` Route once at load; stop copying on every play/seek
+### 2.1 `[x]` Route once at load; stop copying on every play/seek
 
 **Problem:** every play, seek, and loop change memcpys the entire remaining audio of every track on the main thread. Memory is also enormous: `scratchBuffer` and `scratchLoopBuffer` are each full-length × hardware-channel-count. (8 five-minute stems on an 8-channel device ≈ multiple GB, mostly zeros.)
 
@@ -88,20 +88,20 @@ Keep the safety margin ≥ 50 ms; it is inaudible for a transport start and make
 
 Verify after this change: play, pause/resume, seek, loop with intro segment, loop-region drag, and Reset Trims all still work; memory footprint (Xcode memory gauge) drops dramatically for multi-track songs.
 
-### 2.2 `[ ]` Stop seeking on every mouse-move
+### 2.2 `[x]` Stop seeking on every mouse-move
 
 **Problem:** the timeline `DragGesture.onChanged` calls `player.seek(to:)` per event; each seek is a full stop→copy→reschedule→restart across all tracks. Loop-handle drags restart playback `onEnded` too, which is fine, but the timeline is the hot path.
 
 **Fix:** during `onChanged`, only update `playbackProgress` (and pause the UI timer or gate `updateProgress` so it doesn't fight the drag). Perform the real `seek(to:)` once in `onEnded`. While scrubbing during playback, either keep audio playing untouched or stop it — pick one, but do not reschedule per event.
 
-### 2.3 `[ ]` Cheaper metering
+### 2.3 `[x]` Cheaper metering
 
 **Fixes in `processMeter` / tap setup:**
 - Use `vDSP_rmsqv` (import Accelerate) over the full buffer instead of the manual stride-10 loop (the stride also skews readings).
 - Throttle **before** hopping to the main actor: keep a `lastDispatch` timestamp captured by the tap closure (an atomic or a simple class box per track) and skip the `Task { @MainActor }` entirely unless >30 ms elapsed. Currently every tap callback (~40–90/s per track) spawns a task.
 - Guard `frames > 0` before dividing.
 
-### 2.4 `[ ]` Timer and end-of-playback detection
+### 2.4 `[x]` Timer and end-of-playback detection
 
 - Add the progress `Timer` to `RunLoop.main` in `.common` mode (`RunLoop.main.add(timer, forMode: .common)`) so the playhead doesn't freeze during menu tracking/drags. (Or replace with a display link.)
 - Detect end-of-song via the player's completion callback — `scheduleBuffer(_:at:options:completionCallbackType: .dataPlayedBack)` on the final segment — instead of polling for `playbackProgress >= 1.0`. Keep the poll as a backstop. Completion handlers fire on a background thread: hop to `@MainActor` and ignore stale callbacks (compare against a generation counter incremented on every stop/seek, else an old callback from a superseded schedule will stop fresh playback).
@@ -168,3 +168,5 @@ After 1.3, shorter stems pad with silence. Add a small per-track indicator (e.g.
 - 2026-07-06 — Plan created. Decisions locked in: no sample-rate conversion (educational constraint); admin gate = Authorization Services (macOS admin-group credentials), scheduled in Phase 3.
 - 2026-07-06 — Backups created before any code changes: git tag `pre-sync-overhaul-2026-07-06` on `main` (commit 7fbed88) and zip `../Audiyo-source-backup-2026-07-06.zip` (source, no .git). All work happens on branch `sync-overhaul`; `main` is untouched.
 - 2026-07-06 — Phase 1 (1.1–1.4) implemented in `ContentView.swift` on branch `sync-overhaul`. Builds clean (only pre-existing warnings remain: dangling `UnsafeBufferPointer` in `getDeviceOutputChannelCount`, CFString pointer in `fetchDevices`, deprecated `onChange` — fold into Phase 3). Manual audio verification (phase-cancellation test, short-stem test, latency check) NOT yet run — do this before calling Phase 1 complete against the verification checklist.
+- 2026-07-06 — Git history rewrite completed (separate session): .git shrank 11GB → 4.3MB, all SHAs changed, `.gitignore` for build products added. Tag and branches survived.
+- 2026-07-06 — Phase 2 (2.1–2.4) implemented on `sync-overhaul`. `Track` now holds one `routedBuffer` (built once at load via `copySlice`); playback schedules zero-copy slices via `sliceBuffer(of:from:frameCount:)` using `AVAudioPCMBuffer(pcmFormat:bufferListNoCopy:)` — the fallback path in 2.1(3) was not needed. The optional 1-channel-buffer + mixer channel-map memory reduction was NOT done (routed buffers are still hw-channel-count wide). End detection: `.dataPlayedBack` completion on player 0's tail buffer guarded by a `scheduleGeneration` counter (poll kept as backstop). Timer runs in `.common` mode. Scrubbing is visual-only until gesture end (`previewSeek`/`isScrubbing`). Meters use `vDSP_rmsqv` with throttling before the main-actor hop (`MeterThrottle`, `nonisolated(unsafe)` because the project uses default-MainActor isolation). Builds clean; manual verification still pending for Phases 1+2 together.
