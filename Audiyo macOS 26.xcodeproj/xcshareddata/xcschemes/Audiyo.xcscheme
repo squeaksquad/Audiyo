@@ -45,7 +45,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "D4E208282EEB5BFB00E518F7"
-            BuildableName = "Audiyo macOS 26.app"
+            BuildableName = "Audiyo.app"
             BlueprintName = "Audiyo macOS 26"
             ReferencedContainer = "container:Audiyo macOS 26.xcodeproj">
          </BuildableReference>
