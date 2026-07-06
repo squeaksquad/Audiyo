@@ -854,17 +854,22 @@ struct TimelineView: View {
                     Rectangle().fill(Color.white).frame(width: 2, height: 30)
                         .offset(x: geo.size.width * CGFloat(player.playbackProgress)).allowsHitTesting(false)
                     
-                    Circle().fill(Color.green).frame(width: 16, height: 16)
-                        .offset(x: (geo.size.width * CGFloat(player.loopStart)) - 8)
-                        .gesture(DragGesture().onChanged { value in
-                            player.loopStart = max(0, min(player.loopEnd - 0.001, value.location.x / geo.size.width))
-                        }.onEnded { _ in player.restartIfPlaying() })
-                    
-                    Circle().fill(Color.red).frame(width: 16, height: 16)
-                        .offset(x: (geo.size.width * CGFloat(player.loopEnd)) - 8)
-                        .gesture(DragGesture().onChanged { value in
-                            player.loopEnd = min(1.0, max(player.loopStart + 0.001, value.location.x / geo.size.width))
-                        }.onEnded { _ in player.restartIfPlaying() })
+                    // Handles only exist while looping; otherwise they sit on
+                    // top of the timeline and steal seek clicks/drags that
+                    // land near them.
+                    if player.isLooping {
+                        Circle().fill(Color.green).frame(width: 16, height: 16)
+                            .offset(x: (geo.size.width * CGFloat(player.loopStart)) - 8)
+                            .gesture(DragGesture().onChanged { value in
+                                player.loopStart = max(0, min(player.loopEnd - 0.001, value.location.x / geo.size.width))
+                            }.onEnded { _ in if player.isLooping { player.restartIfPlaying() } })
+
+                        Circle().fill(Color.red).frame(width: 16, height: 16)
+                            .offset(x: (geo.size.width * CGFloat(player.loopEnd)) - 8)
+                            .gesture(DragGesture().onChanged { value in
+                                player.loopEnd = min(1.0, max(player.loopStart + 0.001, value.location.x / geo.size.width))
+                            }.onEnded { _ in if player.isLooping { player.restartIfPlaying() } })
+                    }
                 }
             }.frame(height: 30)
         }
