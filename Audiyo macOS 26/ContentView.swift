@@ -317,18 +317,15 @@ class AudioPlayer {
         }
 
         // Shared start time, computed only after all scheduling work is done.
-        // Sample time on the output node is the engine's common clock; the
-        // host-time fallback must convert seconds to mach ticks (ticks are not
-        // nanoseconds on Apple Silicon).
+        // Anchored to the mach host clock (ticks, NOT nanoseconds on Apple
+        // Silicon — convert via hostTime(forSeconds:)). Do not anchor to
+        // outputNode.lastRenderTime sample time: the engine's sample counter
+        // resets across engine restarts (song switches, device changes) and
+        // can report a stale pre-restart value that still passes
+        // isSampleTimeValid, which starts players against the wrong epoch and
+        // desyncs the playhead math from the audio.
         let delaySeconds = 0.05
-        let startTime: AVAudioTime
-        let outputSampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
-        if let renderTime = engine.outputNode.lastRenderTime, renderTime.isSampleTimeValid, outputSampleRate > 0 {
-            let startSample = renderTime.sampleTime + AVAudioFramePosition(delaySeconds * outputSampleRate)
-            startTime = AVAudioTime(sampleTime: startSample, atRate: outputSampleRate)
-        } else {
-            startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delaySeconds))
-        }
+        let startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delaySeconds))
 
         // Pass 2: nothing but play calls, every player gets the identical time.
         players.forEach { $0.play(at: startTime) }
@@ -396,8 +393,9 @@ class AudioPlayer {
     private func updateProgress() {
         guard !isScrubbing else { return }
         guard let node = players.first, let nodeTime = node.lastRenderTime, let playerTime = node.playerTime(forNodeTime: nodeTime) else { return }
-        
-        let framesPlayed = playerTime.sampleTime
+
+        // Negative during the ~50ms arm window before the scheduled start.
+        let framesPlayed = max(0, playerTime.sampleTime)
         var absoluteFrame: AVAudioFramePosition = 0
         let loopEndFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopEnd)
         
