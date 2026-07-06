@@ -3,6 +3,7 @@ import AVFoundation
 import CoreAudio
 import AudioToolbox
 import Observation
+import Accelerate
 
 // MARK: - 1. Data Models
 
@@ -168,28 +169,45 @@ class AudioPlayer {
         
         let hardwareLimit = Int(hwFormat.channelCount)
         let filesToLoad = self.currentURLs.prefix(hardwareLimit)
-        
-        for (index, url) in filesToLoad.enumerated() {
+
+        // Open every file before allocating anything: duration, loop math, and
+        // scratch buffer capacity must all use the longest stem, so that every
+        // player schedules identical-length buffers (shorter stems pad with
+        // silence). Unequal scheduled lengths would break loop sync.
+        var loadedFiles: [(url: URL, file: AVAudioFile)] = []
+        for url in filesToLoad {
             do {
-                let file = try AVAudioFile(forReading: url)
-                let sr = file.processingFormat.sampleRate
-                
+                loadedFiles.append((url, try AVAudioFile(forReading: url)))
+            } catch {
+                self.errorMessage = "Error: \(error.localizedDescription)"
+                self.showError = true
+            }
+        }
+        guard let firstFile = loadedFiles.first?.file else { return }
+        let maxLength = loadedFiles.map { $0.file.length }.max() ?? 0
+        guard maxLength > 0 else { return }
+
+        self.audioLengthSamples = maxLength
+        self.audioSampleRate = firstFile.processingFormat.sampleRate
+        self.totalDuration = Double(maxLength) / audioSampleRate
+
+        // Intentionally no sample-rate conversion: mismatched clocking is a
+        // teaching moment. Warn and play at the wrong rate.
+        if abs(hwFormat.sampleRate - audioSampleRate) > 1.0 {
+            self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(audioSampleRate))Hz"
+            self.showError = true
+        }
+
+        for (index, loaded) in loadedFiles.enumerated() {
+            let url = loaded.url
+            let file = loaded.file
+            let sr = file.processingFormat.sampleRate
+            do {
                 guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
                 try file.read(into: buffer)
-                guard let scratch = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                guard let scratchLoop = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
-                
-                if index == 0 {
-                    self.audioLengthSamples = file.length
-                    self.audioSampleRate = sr
-                    self.totalDuration = Double(audioLengthSamples) / audioSampleRate
-                    
-                    if abs(hwFormat.sampleRate - sr) > 1.0 {
-                        self.errorMessage = "⚠️ Mismatch: Device is \(Int(hwFormat.sampleRate))Hz, File is \(Int(sr))Hz"
-                        self.showError = true
-                    }
-                }
-                
+                guard let scratch = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
+                guard let scratchLoop = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: AVAudioFrameCount(maxLength)) else { continue }
+
                 let player = AVAudioPlayerNode()
                 let vol = savedVolumes[index] ?? 1.0
                 player.volume = vol
@@ -229,32 +247,30 @@ class AudioPlayer {
         let shouldLoop = isLooping && startFrame < loopEndFrame
         self.currentEndFrame = shouldLoop ? loopEndFrame : audioLengthSamples
         
-        let delaySeconds = 0.02
-        let hostTime = mach_absolute_time() + UInt64(delaySeconds * 1_000_000_000)
-        let startTime = AVAudioTime(hostTime: hostTime)
-        
         players.forEach { $0.stop() }
-        
+
+        // Pass 1: schedule every player's buffers before any player is armed,
+        // so copy time can't eat into the shared start deadline.
         for (i, player) in players.enumerated() {
             let source = tracks[i].originalBuffer
             let scratch = tracks[i].scratchBuffer
             let scratchLoop = tracks[i].scratchLoopBuffer
-            
+
             if shouldLoop {
                 let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
-                
+
                 let introLen = loopEndFrame - startFrame
                 if introLen > 0 {
                     copySlice(from: source, to: scratch, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i)
                     player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
                 }
-                
+
                 let loopLen = loopEndFrame - loopStartFrame
                 if loopLen > 0 {
                     copySlice(from: source, to: scratchLoop, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i)
                     player.scheduleBuffer(scratchLoop, at: nil, options: .loops, completionHandler: nil)
                 }
-                
+
             } else {
                 let length = audioLengthSamples - startFrame
                 if length > 0 {
@@ -262,9 +278,25 @@ class AudioPlayer {
                     player.scheduleBuffer(scratch, at: nil, options: [], completionHandler: nil)
                 }
             }
-            player.play(at: startTime)
         }
-        
+
+        // Shared start time, computed only after all scheduling work is done.
+        // Sample time on the output node is the engine's common clock; the
+        // host-time fallback must convert seconds to mach ticks (ticks are not
+        // nanoseconds on Apple Silicon).
+        let delaySeconds = 0.05
+        let startTime: AVAudioTime
+        let outputSampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        if let renderTime = engine.outputNode.lastRenderTime, renderTime.isSampleTimeValid, outputSampleRate > 0 {
+            let startSample = renderTime.sampleTime + AVAudioFramePosition(delaySeconds * outputSampleRate)
+            startTime = AVAudioTime(sampleTime: startSample, atRate: outputSampleRate)
+        } else {
+            startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delaySeconds))
+        }
+
+        // Pass 2: nothing but play calls, every player gets the identical time.
+        players.forEach { $0.play(at: startTime) }
+
         self.playbackProgress = effectiveStartProgress
         isPlaying = true
         DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { self.startTimer() }
@@ -277,10 +309,27 @@ class AudioPlayer {
         for ch in 0..<destChannels {
             if let ptr = destination.floatChannelData?[ch] { memset(ptr, 0, Int(frameCount) * MemoryLayout<Float>.size) }
         }
-        if let srcBasePtr = source.floatChannelData?[0],
-           let dstPtr = destination.floatChannelData?[targetChannel] {
-            let srcOffsetPtr = srcBasePtr.advanced(by: Int(startFrame))
-            memcpy(dstPtr, srcOffsetPtr, Int(frameCount) * MemoryLayout<Float>.size)
+
+        // frameCount is sized to the longest stem; a shorter source only has
+        // `available` frames past startFrame, the rest stays silent.
+        let sourceLength = AVAudioFramePosition(source.frameLength)
+        guard startFrame >= 0, startFrame < sourceLength else { return }
+        let copyCount = min(frameCount, AVAudioFrameCount(sourceLength - startFrame))
+        guard copyCount > 0 else { return }
+
+        guard let srcChannels = source.floatChannelData,
+              let dstPtr = destination.floatChannelData?[targetChannel] else { return }
+        memcpy(dstPtr, srcChannels[0].advanced(by: Int(startFrame)), Int(copyCount) * MemoryLayout<Float>.size)
+
+        // Stems are expected to be mono; fold multi-channel sources down by
+        // averaging so no channel is silently dropped.
+        let srcChannelCount = Int(source.format.channelCount)
+        if srcChannelCount > 1 {
+            for ch in 1..<srcChannelCount {
+                vDSP_vadd(dstPtr, 1, srcChannels[ch].advanced(by: Int(startFrame)), 1, dstPtr, 1, vDSP_Length(copyCount))
+            }
+            var scale = 1.0 / Float(srcChannelCount)
+            vDSP_vsmul(dstPtr, 1, &scale, dstPtr, 1, vDSP_Length(copyCount))
         }
     }
     
