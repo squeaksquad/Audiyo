@@ -329,7 +329,9 @@ class AudioPlayer {
 
                 while remaining > 0 {
                     let loopLen = state.loopEnd - state.loopStart
-                    let loopActive = state.isLooping && loopLen > 0 && state.position < state.loopEnd
+                    // <= so that landing exactly on loopEnd wraps instead of
+                    // falling through to the rest of the song.
+                    let loopActive = state.isLooping && loopLen > 0 && state.position <= state.loopEnd
                     let boundary = loopActive ? state.loopEnd : state.length
                     let n = min(remaining, Int(boundary - state.position))
                     if n <= 0 {
