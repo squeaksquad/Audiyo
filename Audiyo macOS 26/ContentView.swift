@@ -59,7 +59,7 @@ class Track: Identifiable {
 // main actor only holds the lock for a handful of stores on transport
 // actions, so the render thread never waits meaningfully. Position is
 // advanced by the render thread and read by the UI timer.
-private final class TransportState: @unchecked Sendable {
+nonisolated private final class TransportState: @unchecked Sendable {
     private let lock: UnsafeMutablePointer<os_unfair_lock> = {
         let l = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
         l.initialize(to: os_unfair_lock())
