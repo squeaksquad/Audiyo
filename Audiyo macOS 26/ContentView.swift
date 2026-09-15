@@ -1052,6 +1052,7 @@ struct ShortcutsView: View {
         ("O", "Set Loop Out"),
         ("L", "Toggle loop on/off"),
         ("CMD+Shift+L", "Reset loop region"),
+        ("CMD+Shift+R", "Rescan devices"),
         ("CMD+Shift+A", "Open Audio MIDI Setup")
     ]
     var body: some View {
@@ -1299,16 +1300,29 @@ struct ContentView: View {
                             .frame(width: 200)
                             .onChange(of: player.selectedDeviceID) { player.setOutputDevice(id: player.selectedDeviceID) }
                             
-                            Button(action: { player.refreshHardwareState() }) {
-                                Image(systemName: "arrow.clockwise")
-                            }
-                            .help("Rescan Devices: re-read the CoreAudio device list and rebuild the engine")
+                            // Device utilities live in a menu so their full
+                            // labels fit without widening the toolbar.
+                            Menu {
+                                Button {
+                                    player.refreshHardwareState()
+                                } label: {
+                                    Label("Rescan Devices", systemImage: "arrow.clockwise")
+                                }
+                                .keyboardShortcut("r", modifiers: [.command, .shift])
 
-                            Button(action: openAudioMIDISetup) {
-                                Image(systemName: "slider.horizontal.3")
+                                Button {
+                                    openAudioMIDISetup()
+                                } label: {
+                                    Label("Open Audio MIDI Setup…", systemImage: "slider.horizontal.3")
+                                }
+                                .keyboardShortcut("a", modifiers: [.command, .shift])
+                            } label: {
+                                Image(systemName: "gearshape")
                             }
-                            .help("Open Audio MIDI Setup (⌘⇧A)")
-                            .keyboardShortcut("a", modifiers: [.command, .shift])
+                            .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
+                            .help("Device utilities: rescan devices, open Audio MIDI Setup")
                         }
                     }
                 }
