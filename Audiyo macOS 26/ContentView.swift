@@ -828,12 +828,19 @@ struct RoutingMatrixView: View {
     private let cell: CGFloat = 26
     private let labelWidth: CGFloat = 160
 
-    // Drag state: a press-and-sweep routes every cell it passes over; a
-    // click that never leaves its starting cell toggles that cell instead.
+    // Drag behaviour. The press routes the cell under the pointer. Once the
+    // pointer travels about a cell away, the sweep angle locks an intent for
+    // the rest of the drag:
+    //   diagonal  -> sequential: each row from the start gets start output +/- 1 per row
+    //   vertical  -> stack: every row between start and pointer gets the start output
+    //   horizontal-> move: only the start row follows the pointer's column
+    // Snapping to the diagonal means a quick swipe fills 1-2-3-4... exactly
+    // even when the pointer path wanders off the diagonal.
+    private enum DragMode { case undecided, sequential(step: Int), stack, move }
     @State private var dragStartCell: (slot: Int, ch: Int)?
+    @State private var dragStartPoint: CGPoint?
     @State private var dragStartWasActive = false
-    @State private var dragLastPoint: CGPoint?
-    @State private var dragMoved = false
+    @State private var dragMode: DragMode = .undecided
 
     private func cellAt(_ point: CGPoint) -> (slot: Int, ch: Int)? {
         let pitch = cell + 2
@@ -842,8 +849,45 @@ struct RoutingMatrixView: View {
         return (slot, ch)
     }
 
-    private func route(_ c: (slot: Int, ch: Int)) {
-        if player.outputChannel(forSlot: c.slot) != c.ch { player.setOutputChannel(c.ch, forSlot: c.slot) }
+    // Nearest in-range cell, so dragging past the grid edge keeps working.
+    private func clampedCellAt(_ point: CGPoint) -> (slot: Int, ch: Int) {
+        let pitch = cell + 2
+        let ch = min(max(Int(floor(point.x / pitch)), 0), outputCount - 1)
+        let slot = min(max(Int(floor(point.y / pitch)), 0), slotCount - 1)
+        return (slot, ch)
+    }
+
+    private func route(_ slot: Int, _ ch: Int) {
+        guard ch >= 0, ch < outputCount, slot >= 0, slot < slotCount else { return }
+        if player.outputChannel(forSlot: slot) != ch { player.setOutputChannel(ch, forSlot: slot) }
+    }
+
+    private func decideMode(dx: CGFloat, dy: CGFloat) -> DragMode {
+        let ax = abs(dx), ay = abs(dy)
+        // Generous diagonal band: anything not clearly axis-aligned is
+        // treated as a sequential sweep.
+        if ay < 0.35 * ax { return .move }
+        if ax < 0.35 * ay { return .stack }
+        return .sequential(step: (dx.sign == dy.sign) ? 1 : -1)
+    }
+
+    private func applyDrag(to point: CGPoint) {
+        guard let start = dragStartCell else { return }
+        let cur = clampedCellAt(point)
+        switch dragMode {
+        case .undecided:
+            break
+        case .move:
+            route(start.slot, cur.ch)
+        case .stack:
+            for slot in stride(from: start.slot, through: cur.slot, by: cur.slot >= start.slot ? 1 : -1) {
+                route(slot, start.ch)
+            }
+        case .sequential(let step):
+            for slot in stride(from: start.slot, through: cur.slot, by: cur.slot >= start.slot ? 1 : -1) {
+                route(slot, start.ch + step * (slot - start.slot))
+            }
+        }
     }
 
     private var cellGesture: some Gesture {
@@ -851,37 +895,29 @@ struct RoutingMatrixView: View {
             .onChanged { value in
                 let point = value.location
                 if dragStartCell == nil {
-                    // Press: route the cell under the pointer right away.
                     guard let c = cellAt(point) else { return }
                     dragStartCell = c
+                    dragStartPoint = point
                     dragStartWasActive = player.outputChannel(forSlot: c.slot) == c.ch
-                    dragLastPoint = point
-                    dragMoved = false
-                    route(c)
+                    dragMode = .undecided
+                    route(c.slot, c.ch)
                     return
                 }
-                // Walk the segment from the last sample so fast sweeps
-                // don't skip cells.
-                let from = dragLastPoint ?? point
-                let steps = max(1, Int(max(abs(point.x - from.x), abs(point.y - from.y)) / (cell / 2)))
-                for i in 1...steps {
-                    let t = CGFloat(i) / CGFloat(steps)
-                    let p = CGPoint(x: from.x + (point.x - from.x) * t, y: from.y + (point.y - from.y) * t)
-                    if let c = cellAt(p) {
-                        if let start = dragStartCell, c.slot != start.slot || c.ch != start.ch { dragMoved = true }
-                        route(c)
-                    }
+                if case .undecided = dragMode, let origin = dragStartPoint {
+                    let dx = point.x - origin.x, dy = point.y - origin.y
+                    guard hypot(dx, dy) >= cell * 0.9 else { return }
+                    dragMode = decideMode(dx: dx, dy: dy)
                 }
-                dragLastPoint = point
+                applyDrag(to: point)
             }
             .onEnded { _ in
                 // A click on an already-active cell that never moved: mute it.
-                if let start = dragStartCell, !dragMoved, dragStartWasActive {
+                if let start = dragStartCell, case .undecided = dragMode, dragStartWasActive {
                     player.setOutputChannel(-1, forSlot: start.slot)
                 }
                 dragStartCell = nil
-                dragLastPoint = nil
-                dragMoved = false
+                dragStartPoint = nil
+                dragMode = .undecided
             }
     }
 
@@ -922,7 +958,7 @@ struct RoutingMatrixView: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
 
-            Text("Each row is a stem, each column is a device output. Click a cell to route, or press and drag across the grid to route several stems at once. Click the active cell again to mute that stem. Routing resets to outputs 1–\(slotCount) every time the app launches.")
+            Text("Each row is a stem, each column is a device output. Click a cell to route, or press and drag diagonally to route stems to consecutive outputs in one sweep (drag straight down to stack stems on one output). Click the active cell again to mute that stem. Routing resets to outputs 1–\(slotCount) every time the app launches.")
                 .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
