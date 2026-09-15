@@ -826,6 +826,61 @@ struct RoutingMatrixView: View {
     @Environment(\.dismiss) private var dismiss
 
     private let cell: CGFloat = 26
+    private let labelWidth: CGFloat = 160
+
+    // Drag state: a press-and-sweep routes every cell it passes over; a
+    // click that never leaves its starting cell toggles that cell instead.
+    @State private var dragStartCell: (slot: Int, ch: Int)?
+    @State private var dragStartWasActive = false
+    @State private var dragLastPoint: CGPoint?
+    @State private var dragMoved = false
+
+    private func cellAt(_ point: CGPoint) -> (slot: Int, ch: Int)? {
+        let pitch = cell + 2
+        let ch = Int(floor(point.x / pitch)), slot = Int(floor(point.y / pitch))
+        guard ch >= 0, ch < outputCount, slot >= 0, slot < slotCount else { return nil }
+        return (slot, ch)
+    }
+
+    private func route(_ c: (slot: Int, ch: Int)) {
+        if player.outputChannel(forSlot: c.slot) != c.ch { player.setOutputChannel(c.ch, forSlot: c.slot) }
+    }
+
+    private var cellGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                let point = value.location
+                if dragStartCell == nil {
+                    guard let c = cellAt(point) else { return }
+                    dragStartCell = c
+                    dragStartWasActive = player.outputChannel(forSlot: c.slot) == c.ch
+                    dragLastPoint = point
+                    dragMoved = false
+                    return
+                }
+                // Walk the segment from the last sample so fast sweeps
+                // don't skip cells.
+                let from = dragLastPoint ?? point
+                let steps = max(1, Int(max(abs(point.x - from.x), abs(point.y - from.y)) / (cell / 2)))
+                for i in 1...steps {
+                    let t = CGFloat(i) / CGFloat(steps)
+                    let p = CGPoint(x: from.x + (point.x - from.x) * t, y: from.y + (point.y - from.y) * t)
+                    if let c = cellAt(p) {
+                        if let start = dragStartCell, c.slot != start.slot || c.ch != start.ch { dragMoved = true }
+                        if dragMoved { route(c) }
+                    }
+                }
+                dragLastPoint = point
+            }
+            .onEnded { _ in
+                if let start = dragStartCell, !dragMoved {
+                    player.setOutputChannel(dragStartWasActive ? -1 : start.ch, forSlot: start.slot)
+                }
+                dragStartCell = nil
+                dragLastPoint = nil
+                dragMoved = false
+            }
+    }
 
     // With no song loaded, show the generic 12 slots so routing can be set
     // up before the student picks a song.
@@ -846,7 +901,7 @@ struct RoutingMatrixView: View {
         (0..<slotCount).allSatisfy { player.outputChannel(forSlot: $0) == start + $0 }
     }
 
-    private var sheetWidth: CGFloat { min(200 + CGFloat(outputCount) * (cell + 2) + 48, 1500) }
+    private var sheetWidth: CGFloat { min(labelWidth + 40 + CGFloat(outputCount) * (cell + 2) + 48, 1500) }
     private var sheetHeight: CGFloat { min(260 + CGFloat(slotCount + 2) * (cell + 2), 900) }
 
     private var hasUnrouted: Bool {
@@ -864,7 +919,7 @@ struct RoutingMatrixView: View {
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
 
-            Text("Each row is a stem, each column is a device output. Click a cell to route; click the active cell again to mute that stem. Routing resets to outputs 1–\(slotCount) every time the app launches.")
+            Text("Each row is a stem, each column is a device output. Click a cell to route, or press and drag across the grid to route several stems at once. Click the active cell again to mute that stem. Routing resets to outputs 1–\(slotCount) every time the app launches.")
                 .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
@@ -894,52 +949,52 @@ struct RoutingMatrixView: View {
             }
 
             ScrollView([.horizontal, .vertical]) {
-                Grid(horizontalSpacing: 2, verticalSpacing: 2) {
-                    GridRow {
+                HStack(alignment: .top, spacing: 2) {
+                    // Row labels
+                    VStack(alignment: .leading, spacing: 2) {
                         Text("STEMS ↓")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.secondary)
-                            .frame(width: 160, alignment: .leading)
-                        Text("DEVICE OUTPUTS →")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.secondary)
-                            .gridCellColumns(outputCount)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.leading, 4)
-                    }
-                    .padding(.bottom, 4)
-                    GridRow {
-                        Text("").frame(width: 160)
-                        ForEach(0..<outputCount, id: \.self) { ch in
-                            Text("\(ch + 1)")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .frame(width: cell, height: cell)
-                        }
-                    }
-                    ForEach(0..<slotCount, id: \.self) { slot in
-                        let current = player.outputChannel(forSlot: slot)
-                        GridRow {
+                            .font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
+                            .frame(width: labelWidth, height: cell, alignment: .leading)
+                        Text("").frame(width: labelWidth, height: cell)
+                        ForEach(0..<slotCount, id: \.self) { slot in
                             Text(slotName(slot))
                                 .font(.callout).lineLimit(1).truncationMode(.tail)
-                                .frame(width: 160, alignment: .leading)
+                                .frame(width: labelWidth, height: cell, alignment: .leading)
                                 .help(slotName(slot))
+                        }
+                    }
+                    // Column headers + cells
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("DEVICE OUTPUTS →")
+                            .font(.system(size: 10, weight: .bold)).foregroundColor(.secondary)
+                            .frame(height: cell, alignment: .leading).padding(.leading, 4)
+                        HStack(spacing: 2) {
                             ForEach(0..<outputCount, id: \.self) { ch in
-                                let active = current == ch
-                                Button {
-                                    player.setOutputChannel(active ? -1 : ch, forSlot: slot)
-                                } label: {
-                                    ZStack {
-                                        RoundedRectangle(cornerRadius: 4)
-                                            .fill(active ? Color.accentColor : Color.gray.opacity(0.18))
-                                        if active { Circle().fill(Color.white).frame(width: 8, height: 8) }
-                                    }
+                                Text("\(ch + 1)")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.secondary)
                                     .frame(width: cell, height: cell)
-                                }
-                                .buttonStyle(.plain)
-                                .help("\(slotName(slot)) → Output \(ch + 1)")
                             }
                         }
+                        VStack(spacing: 2) {
+                            ForEach(0..<slotCount, id: \.self) { slot in
+                                let current = player.outputChannel(forSlot: slot)
+                                HStack(spacing: 2) {
+                                    ForEach(0..<outputCount, id: \.self) { ch in
+                                        let active = current == ch
+                                        ZStack {
+                                            RoundedRectangle(cornerRadius: 4)
+                                                .fill(active ? Color.accentColor : Color.gray.opacity(0.18))
+                                            if active { Circle().fill(Color.white).frame(width: 8, height: 8) }
+                                        }
+                                        .frame(width: cell, height: cell)
+                                        .help("\(slotName(slot)) → Output \(ch + 1)")
+                                    }
+                                }
+                            }
+                        }
+                        .contentShape(Rectangle())
+                        .gesture(cellGesture)
                     }
                 }
                 .padding(.trailing, 8)
