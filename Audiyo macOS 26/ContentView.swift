@@ -55,20 +55,37 @@ class Track: Identifiable {
     }
 }
 
-// Tap callbacks for one player arrive serially on its render tap thread,
-// so unsynchronized access is safe.
-private final class MeterThrottle: @unchecked Sendable {
-    nonisolated(unsafe) var lastEmit: CFTimeInterval = 0
-}
+// Everything the render callback needs, guarded by an unfair lock. The
+// main actor only holds the lock for a handful of stores on transport
+// actions, so the render thread never waits meaningfully. Position is
+// advanced by the render thread and read by the UI timer.
+private final class TransportState: @unchecked Sendable {
+    private let lock: UnsafeMutablePointer<os_unfair_lock> = {
+        let l = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        l.initialize(to: os_unfair_lock())
+        return l
+    }()
+    deinit { lock.deinitialize(count: 1); lock.deallocate() }
 
-// Copy of the routing table readable from the render tap threads.
-private final class RoutingTable: @unchecked Sendable {
-    private let lock = NSLock()
-    private var channels: [Int] = []
-    func set(_ new: [Int]) { lock.lock(); channels = new; lock.unlock() }
-    func channel(forSlot slot: Int) -> Int {
-        lock.lock(); defer { lock.unlock() }
-        return slot < channels.count ? channels[slot] : slot
+    // Set on load
+    var stems: [AVAudioPCMBuffer] = []     // mono, one per track
+    var length: AVAudioFramePosition = 0   // longest stem
+    // Set by the main actor
+    var volumes: [Float] = []
+    var channels: [Int] = []               // routed output per track, -1 = muted
+    var isPlaying = false
+    var isLooping = false
+    var loopStart: AVAudioFramePosition = 0
+    var loopEnd: AVAudioFramePosition = 0
+    // Owned by the render thread while playing
+    var position: AVAudioFramePosition = 0
+    var finished = false
+    var meters: [Float] = []               // dBFS per track, last render block
+    var sumSq: [Float] = []                // render-thread scratch, sized with meters
+
+    @inline(__always) func withLock<T>(_ body: () -> T) -> T {
+        os_unfair_lock_lock(lock); defer { os_unfair_lock_unlock(lock) }
+        return body()
     }
 }
 
@@ -86,12 +103,14 @@ class AudioPlayer {
     var deviceSampleRate: Double = 44100.0
     
     var isPlaying = false
-    var isLooping = false
+    var isLooping = false { didSet { syncLoopState() } }
     var playbackProgress: Double = 0.0
     
     var markers: [Int: Double] = [:]
-    var loopStart: Double = 0.0
-    var loopEnd: Double = 1.0
+    // Loop bounds as 0...1 progress; edits (including timeline handle
+    // drags) push straight to the render thread, no restart needed.
+    var loopStart: Double = 0.0 { didSet { syncLoopState() } }
+    var loopEnd: Double = 1.0 { didSet { syncLoopState() } }
     
     var currentDisplayTime: String = "0:00"
     var totalDuration: Double = 0.0
@@ -105,22 +124,19 @@ class AudioPlayer {
     // starts on outputs 1..N and a student can't inherit a stray routing.
     var outputRouting: [Int] = Array(0..<12)
     var outputChannelCount: Int { Int(hardwareFormat?.channelCount ?? 2) }
-    private let routingTable = RoutingTable()
     
     private let engine = AVAudioEngine()
     private let mainMixer = AVAudioMixerNode()
-    private var players: [AVAudioPlayerNode] = []
+    // Single render callback mixes every stem into its routed channel,
+    // reading straight from the mono buffers. No per-play allocation, so
+    // play/seek/marker jumps start on the next render cycle.
+    private var sourceNode: AVAudioSourceNode?
+    private let state = TransportState()
     
     private var timer: Timer?
     private var audioSampleRate: Double = 44100.0
     private var audioLengthSamples: AVAudioFramePosition = 0
-    
-    private var currentStartFrame: AVAudioFramePosition = 0
-    private var currentEndFrame: AVAudioFramePosition = 0
 
-    // Invalidates completion callbacks from schedules that a later
-    // stop/seek/play has superseded.
-    private var scheduleGeneration = 0
     // While the user drags the timeline, only the visual playhead moves;
     // the real seek happens on gesture end.
     private var isScrubbing = false
@@ -188,15 +204,16 @@ class AudioPlayer {
     private func setupTracks() {
         stop()
         engine.stop()
-        players.forEach { engine.detach($0) }
+        if let node = sourceNode { engine.detach(node) }
+        sourceNode = nil
         
         // Preserve volumes if reloading same tracks, otherwise default 1.0
         let savedVolumes = tracks.reduce(into: [Int: Float]()) { dict, track in
             dict[track.id] = track.volume
         }
         
-        players.removeAll()
         tracks.removeAll()
+        state.withLock { state.stems = []; state.volumes = []; state.channels = []; state.meters = []; state.sumSq = []; state.length = 0; state.position = 0; state.finished = false }
         setupEngine()
         
         guard let hwFormat = self.hardwareFormat else { return }
@@ -236,6 +253,7 @@ class AudioPlayer {
             self.showError = true
         }
 
+        var stems: [AVAudioPCMBuffer] = []
         for (index, loaded) in loadedFiles.enumerated() {
             let url = loaded.url
             let file = loaded.file
@@ -250,115 +268,137 @@ class AudioPlayer {
                       let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: AVAudioFrameCount(file.length)) else { continue }
                 copySlice(from: fileBuffer, to: mono, startFrame: 0, frameCount: AVAudioFrameCount(file.length), targetChannel: 0)
 
-                let player = AVAudioPlayerNode()
                 let vol = savedVolumes[index] ?? 1.0
-                player.volume = vol
-
-                engine.attach(player)
-                engine.connect(player, to: mainMixer, format: hwFormat)
-                players.append(player)
-
                 let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, monoBuffer: mono)
                 trackObj.volume = vol
                 trackObj.isShorterThanSong = file.length < maxLength
                 trackObj.outputChannel = outputChannel(forSlot: index)
                 tracks.append(trackObj)
-
-                let throttle = MeterThrottle()
-                let routing = routingTable
-                player.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] (buffer, time) in
-                    guard let self = self else { return }
-                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: routing.channel(forSlot: index), throttle: throttle)
-                }
+                stems.append(mono)
             } catch {
                 self.errorMessage = "Error: \(error.localizedDescription)"
                 self.showError = true
             }
         }
-        routingTable.set(outputRouting)
+
+        let volumes = tracks.map { $0.volume }
+        let channels = tracks.map { $0.outputChannel }
+        state.withLock {
+            state.stems = stems
+            state.length = maxLength
+            state.volumes = volumes
+            state.channels = channels
+            state.meters = Array(repeating: -100, count: stems.count)
+            state.sumSq = Array(repeating: 0, count: stems.count)
+            state.position = 0
+            state.finished = false
+            state.isPlaying = false
+        }
+        syncLoopState()
+
+        let node = AVAudioSourceNode(format: hwFormat, renderBlock: Self.makeRenderBlock(state: state))
+        engine.attach(node)
+        engine.connect(node, to: mainMixer, format: hwFormat)
+        sourceNode = node
+
         try? engine.start()
         playbackProgress = 0.0
         updateTimeLabel(progress: 0.0)
+    }
+
+    // MARK: - Render
+    // Runs on the audio render thread. Zeroes the output, then for every
+    // stem accumulates (mono * volume) into its routed channel from the
+    // shared position, splitting the block at the loop/end boundary.
+    nonisolated private static func makeRenderBlock(state: TransportState) -> AVAudioSourceNodeRenderBlock {
+        return { isSilence, _, frameCount, abl -> OSStatus in
+            let out = UnsafeMutableAudioBufferListPointer(abl)
+            for buf in out { if let p = buf.mData { memset(p, 0, Int(buf.mDataByteSize)) } }
+            let outChannels = out.count
+            let frames = Int(frameCount)
+
+            state.withLock {
+                guard state.isPlaying, !state.finished, state.length > 0 else {
+                    isSilence.pointee = true
+                    return
+                }
+                let stemCount = state.stems.count
+                for t in 0..<stemCount { state.sumSq[t] = 0 }
+                var written = 0
+                var remaining = frames
+
+                while remaining > 0 {
+                    let loopLen = state.loopEnd - state.loopStart
+                    let loopActive = state.isLooping && loopLen > 0 && state.position < state.loopEnd
+                    let boundary = loopActive ? state.loopEnd : state.length
+                    let n = min(remaining, Int(boundary - state.position))
+                    if n <= 0 {
+                        if loopActive { state.position = state.loopStart; continue }
+                        state.finished = true
+                        break
+                    }
+
+                    for t in 0..<stemCount {
+                        let ch = state.channels[t]
+                        guard ch >= 0, ch < outChannels,
+                              let dstBase = out[ch].mData?.assumingMemoryBound(to: Float.self),
+                              let src = state.stems[t].floatChannelData?[0] else { continue }
+                        let available = Int(state.stems[t].frameLength) - Int(state.position)
+                        guard available > 0 else { continue }
+                        let c = min(n, available)
+                        var vol = state.volumes[t]
+                        let srcPtr = src.advanced(by: Int(state.position))
+                        let dstPtr = dstBase.advanced(by: written)
+                        vDSP_vsma(srcPtr, 1, &vol, dstPtr, 1, dstPtr, 1, vDSP_Length(c))
+                        var sq: Float = 0
+                        vDSP_svesq(srcPtr, 1, &sq, vDSP_Length(c))
+                        state.sumSq[t] += sq * vol * vol
+                    }
+
+                    state.position += AVAudioFramePosition(n)
+                    written += n
+                    remaining -= n
+                }
+
+                if written > 0 {
+                    for t in 0..<stemCount {
+                        let rms = (state.sumSq[t] / Float(written)).squareRoot()
+                        state.meters[t] = 20 * log10(max(rms, .leastNormalMagnitude))
+                    }
+                }
+            }
+            return noErr
+        }
     }
     
     // MARK: - Playback Logic
     func play(from startProgress: Double? = nil) {
         if !engine.isRunning { try? engine.start() }
-        
+        guard audioLengthSamples > 0 else { return }
+
         let effectiveStartProgress = startProgress ?? (isLooping ? loopStart : playbackProgress)
         let startFrame = AVAudioFramePosition(Double(audioLengthSamples) * effectiveStartProgress)
-        let loopEndFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopEnd)
-        
-        self.currentStartFrame = startFrame
-        
-        let shouldLoop = isLooping && startFrame < loopEndFrame
-        self.currentEndFrame = shouldLoop ? loopEndFrame : audioLengthSamples
-        
-        scheduleGeneration += 1
-        let generation = scheduleGeneration
-        players.forEach { $0.stop() }
 
-        // Pass 1: schedule every player's buffers before any player is armed,
-        // so scheduling time can't eat into the shared start deadline.
-        for (i, player) in players.enumerated() {
-            let mono = tracks[i].monoBuffer
-            let out = outputChannel(forSlot: i)
-
-            if shouldLoop {
-                let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
-
-                let introLen = loopEndFrame - startFrame
-                if introLen > 0, let intro = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: out) {
-                    player.scheduleBuffer(intro, at: nil, options: [], completionHandler: nil)
-                }
-
-                let loopLen = loopEndFrame - loopStartFrame
-                if loopLen > 0, let loop = makeSlice(from: mono, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: out) {
-                    player.scheduleBuffer(loop, at: nil, options: .loops, completionHandler: nil)
-                }
-
-            } else {
-                let length = audioLengthSamples - startFrame
-                if length > 0, let tail = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: out) {
-                    if i == 0 {
-                        // One end-of-song signal is enough; the generation
-                        // check drops callbacks from superseded schedules
-                        // (player.stop() also fires completion handlers).
-                        player.scheduleBuffer(tail, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-                            guard let self else { return }
-                            Task { @MainActor in
-                                guard self.scheduleGeneration == generation, self.isPlaying else { return }
-                                self.stop()
-                                self.playbackProgress = 0.0
-                                self.updateTimeLabel(progress: 0.0)
-                            }
-                        }
-                    } else {
-                        player.scheduleBuffer(tail, at: nil, options: [], completionHandler: nil)
-                    }
-                }
-            }
+        // Audio starts on the next render cycle after this store.
+        state.withLock {
+            state.position = startFrame
+            state.finished = false
+            state.isPlaying = true
         }
-
-        // Shared start time, computed only after all scheduling work is done.
-        // Anchored to the mach host clock (ticks, NOT nanoseconds on Apple
-        // Silicon — convert via hostTime(forSeconds:)). Do not anchor to
-        // outputNode.lastRenderTime sample time: the engine's sample counter
-        // resets across engine restarts (song switches, device changes) and
-        // can report a stale pre-restart value that still passes
-        // isSampleTimeValid, which starts players against the wrong epoch and
-        // desyncs the playhead math from the audio.
-        let delaySeconds = 0.05
-        let startTime = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: delaySeconds))
-
-        // Pass 2: nothing but play calls, every player gets the identical time.
-        players.forEach { $0.play(at: startTime) }
-
         self.playbackProgress = effectiveStartProgress
+        updateTimeLabel(progress: effectiveStartProgress)
         isPlaying = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds) { self.startTimer() }
+        startTimer()
     }
-    
+
+    private func syncLoopState() {
+        let len = Double(audioLengthSamples)
+        let ls = AVAudioFramePosition(len * loopStart)
+        let le = AVAudioFramePosition(len * loopEnd)
+        let looping = isLooping
+        state.withLock { state.loopStart = ls; state.loopEnd = le; state.isLooping = looping }
+    }
+
     private func copySlice(from source: AVAudioPCMBuffer, to destination: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount, targetChannel: Int) {
         destination.frameLength = frameCount
         let destChannels = Int(destination.format.channelCount)
@@ -391,19 +431,6 @@ class AudioPlayer {
         }
     }
 
-    // Builds a freshly allocated hardware-format buffer covering the given
-    // range, with the mono source copied into the track's channel. AVFAudio
-    // owns the result outright and frees it when playback is done — slices
-    // must NOT alias another buffer's memory (AVAudioPCMBuffer with
-    // bufferListNoCopy pointing into a shared allocation crashes in
-    // -[AVAudioBuffer dealloc] on macOS 26; see IMPLEMENTATION_PLAN.md).
-    private func makeSlice(from source: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount, targetChannel: Int) -> AVAudioPCMBuffer? {
-        guard let hwFormat = self.hardwareFormat, frameCount > 0,
-              let slice = AVAudioPCMBuffer(pcmFormat: hwFormat, frameCapacity: frameCount) else { return nil }
-        copySlice(from: source, to: slice, startFrame: startFrame, frameCount: frameCount, targetChannel: targetChannel)
-        return slice
-    }
-    
     // MARK: - Visual Timer
     private func startTimer() {
         timer?.invalidate()
@@ -416,47 +443,35 @@ class AudioPlayer {
     }
 
     private func updateProgress() {
-        guard !isScrubbing else { return }
-        guard let node = players.first, let nodeTime = node.lastRenderTime, let playerTime = node.playerTime(forNodeTime: nodeTime) else { return }
+        let (position, finished, meters) = state.withLock { (state.position, state.finished, state.meters) }
+        for (i, level) in meters.enumerated() where i < tracks.count { tracks[i].meterLevel = level }
 
-        // Negative during the ~50ms arm window before the scheduled start.
-        let framesPlayed = max(0, playerTime.sampleTime)
-        var absoluteFrame: AVAudioFramePosition = 0
-        let loopEndFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopEnd)
-        
-        if isLooping && currentStartFrame < loopEndFrame {
-            let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
-            let loopLength = loopEndFrame - loopStartFrame
-            let introLength = loopEndFrame - currentStartFrame
-            
-            if framesPlayed < introLength {
-                absoluteFrame = currentStartFrame + framesPlayed
-            } else {
-                let framesInLoop = framesPlayed - introLength
-                let offset = framesInLoop % max(1, loopLength)
-                absoluteFrame = loopStartFrame + offset
-            }
-        } else {
-            absoluteFrame = currentStartFrame + framesPlayed
+        if finished {
+            stop()
+            playbackProgress = 0.0
+            updateTimeLabel(progress: 0.0)
+            return
         }
-        
-        let progress = Double(absoluteFrame) / Double(audioLengthSamples)
+        guard !isScrubbing, audioLengthSamples > 0 else { return }
+        let progress = Double(position) / Double(audioLengthSamples)
         self.playbackProgress = min(max(progress, 0.0), 1.0)
         updateTimeLabel(progress: self.playbackProgress)
-        
-        if !isLooping && self.playbackProgress >= 1.0 { stop(); self.playbackProgress = 0.0 }
     }
     
     // MARK: - Controls
     func togglePlay() { if isPlaying { stop() } else { play(from: playbackProgress) } }
-    func toggleLoop() { isLooping.toggle(); restartIfPlaying() }
-    func stop() { scheduleGeneration += 1; players.forEach { $0.stop() }; isPlaying = false; timer?.invalidate(); timer = nil }
+    func toggleLoop() { isLooping.toggle() }
+    func stop() {
+        state.withLock { state.isPlaying = false }
+        isPlaying = false
+        timer?.invalidate(); timer = nil
+        for track in tracks { track.meterLevel = -100 }
+    }
     
     func setVolume(_ vol: Float, index: Int) {
-        if index < players.count {
-            players[index].volume = vol
-            if index < tracks.count { tracks[index].volume = vol }
-        }
+        guard index < tracks.count else { return }
+        tracks[index].volume = vol
+        state.withLock { if index < state.volumes.count { state.volumes[index] = vol } }
     }
     
     // NEW: Function to reset all volume trims to 1.0
@@ -466,7 +481,9 @@ class AudioPlayer {
         }
     }
     
-    func restartIfPlaying() { if isPlaying { play(from: playbackProgress) } }
+    // Loop and routing edits now reach the render thread directly, so
+    // nothing needs restarting. Kept so call sites in the UI stay valid.
+    func restartIfPlaying() {}
 
     // MARK: - Output Routing
     func outputChannel(forSlot slot: Int) -> Int {
@@ -490,15 +507,13 @@ class AudioPlayer {
 
     private func applyRouting() {
         for track in tracks { track.outputChannel = outputChannel(forSlot: track.id) }
-        routingTable.set(outputRouting)
-        // Slices are built per play call, so a routing change takes effect
-        // by rescheduling from the current position.
-        restartIfPlaying()
+        let channels = tracks.map { $0.outputChannel }
+        state.withLock { state.channels = channels }
     }
     
-    func resetLoop() { loopStart = 0.0; loopEnd = 1.0; if isPlaying && isLooping { restartIfPlaying() } }
-    func setLoopIn() { loopStart = playbackProgress; if loopStart >= loopEnd { loopEnd = 1.0 }; if isPlaying && isLooping { restartIfPlaying() } }
-    func setLoopOut() { loopEnd = playbackProgress; if loopEnd <= loopStart { loopStart = 0.0 }; if isPlaying && isLooping { restartIfPlaying() } }
+    func resetLoop() { loopStart = 0.0; loopEnd = 1.0 }
+    func setLoopIn() { loopStart = playbackProgress; if loopStart >= loopEnd { loopEnd = 1.0 } }
+    func setLoopOut() { loopEnd = playbackProgress; if loopEnd <= loopStart { loopStart = 0.0 } }
     func setMarker(at index: Int) { guard index >= 1 && index <= 9 else { return }; markers[index] = playbackProgress }
     func jumpToMarker(at index: Int) { guard let progress = markers[index] else { return }; seek(to: progress) }
     func jumpToStart() { seek(to: isLooping ? loopStart : 0.0) }
@@ -511,13 +526,14 @@ class AudioPlayer {
         updateTimeLabel(progress: progress)
     }
 
+    // Repositions without stopping: the render thread picks up the new
+    // position on its next cycle.
     func seek(to progress: Double) {
         isScrubbing = false
-        let wasPlaying = isPlaying
-        stop()
+        let frame = AVAudioFramePosition(Double(audioLengthSamples) * progress)
+        state.withLock { state.position = frame; state.finished = false }
         self.playbackProgress = progress
         self.updateTimeLabel(progress: progress)
-        if wasPlaying { play(from: progress) }
     }
     
     private func updateTimeLabel(progress: Double) {
@@ -528,26 +544,6 @@ class AudioPlayer {
         if seconds.isNaN || seconds.isInfinite { return "0:00" }
         let m = Int(seconds) / 60; let s = Int(seconds) % 60
         return String(format: "%d:%02d", m, s)
-    }
-    
-    nonisolated private func processMeter(buffer: AVAudioPCMBuffer, trackIndex: Int, channelIndex: Int, throttle: MeterThrottle) {
-        // Throttle before doing any work or hopping to the main actor.
-        let now = CACurrentMediaTime()
-        guard now - throttle.lastEmit > 0.03 else { return }
-        throttle.lastEmit = now
-
-        guard let floatData = buffer.floatChannelData,
-              channelIndex >= 0, channelIndex < Int(buffer.format.channelCount),
-              buffer.frameLength > 0 else { return }
-
-        var rms: Float = 0
-        vDSP_rmsqv(floatData[channelIndex], 1, &rms, vDSP_Length(buffer.frameLength))
-        let avgPower = 20 * log10(max(rms, .leastNormalMagnitude))
-
-        Task { @MainActor in
-            guard trackIndex < self.tracks.count else { return }
-            self.tracks[trackIndex].meterLevel = avgPower
-        }
     }
     
     // MARK: - Library & Hardware
@@ -688,8 +684,7 @@ class AudioPlayer {
         let wasPlaying = isPlaying
         let progress = playbackProgress
         refreshHardwareState()
-        playbackProgress = progress
-        updateTimeLabel(progress: progress)
+        seek(to: progress)
         if wasPlaying { play(from: progress) }
     }
 
