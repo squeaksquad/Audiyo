@@ -841,6 +841,14 @@ struct RoutingMatrixView: View {
         return stride(from: 0, through: outputCount - slotCount, by: slotCount).map { $0 }
     }
 
+    // True when every slot sits on the contiguous block starting at `start`.
+    private func isBlockActive(_ start: Int) -> Bool {
+        (0..<slotCount).allSatisfy { player.outputChannel(forSlot: $0) == start + $0 }
+    }
+
+    private var sheetWidth: CGFloat { min(200 + CGFloat(outputCount) * (cell + 2) + 48, 1500) }
+    private var sheetHeight: CGFloat { min(260 + CGFloat(slotCount + 2) * (cell + 2), 900) }
+
     private var hasUnrouted: Bool {
         (0..<slotCount).contains { let c = player.outputChannel(forSlot: $0); return c < 0 || c >= outputCount }
     }
@@ -860,12 +868,24 @@ struct RoutingMatrixView: View {
                 .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
-                Text("Quick set:").font(.caption).foregroundColor(.secondary)
+                Text("Send stems 1–\(slotCount) to outputs:").font(.callout)
                 ForEach(blockStarts, id: \.self) { start in
-                    Button("Outputs \(start + 1)–\(start + slotCount)") { player.shiftRouting(startingAt: start) }
+                    let active = isBlockActive(start)
+                    Button {
+                        player.shiftRouting(startingAt: start)
+                    } label: {
+                        Text("\(start + 1)–\(start + slotCount)")
+                            .font(.system(.body, design: .monospaced))
+                            .fixedSize()
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(active ? Color.accentColor : Color.gray.opacity(0.25)))
+                            .foregroundColor(active ? .white : .primary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Route stem 1 to output \(start + 1), stem 2 to output \(start + 2), and so on")
                 }
                 Spacer()
-                Button("Reset to Default") { player.resetRouting() }
+                Button("Reset to 1–\(slotCount)") { player.resetRouting() }.fixedSize()
             }
 
             if hasUnrouted {
@@ -875,6 +895,19 @@ struct RoutingMatrixView: View {
 
             ScrollView([.horizontal, .vertical]) {
                 Grid(horizontalSpacing: 2, verticalSpacing: 2) {
+                    GridRow {
+                        Text("STEMS ↓")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 160, alignment: .leading)
+                        Text("DEVICE OUTPUTS →")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.secondary)
+                            .gridCellColumns(outputCount)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.leading, 4)
+                    }
+                    .padding(.bottom, 4)
                     GridRow {
                         Text("").frame(width: 160)
                         ForEach(0..<outputCount, id: \.self) { ch in
@@ -913,7 +946,7 @@ struct RoutingMatrixView: View {
             }
         }
         .padding()
-        .frame(minWidth: 560, idealWidth: 200 + CGFloat(outputCount) * (cell + 2) + 48, minHeight: 320, idealHeight: 200 + CGFloat(slotCount + 1) * (cell + 2))
+        .frame(width: max(640, sheetWidth), height: max(400, sheetHeight))
     }
 }
 
