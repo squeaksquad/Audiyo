@@ -36,6 +36,8 @@ class Track: Identifiable {
 
     var volume: Float = 1.0
     var meterLevel: Float = -100.0
+    // Hardware output channel (0-based) this stem plays on; -1 = unrouted.
+    var outputChannel: Int = 0
     // Shorter stems pad with silence to the longest stem's length; the UI
     // surfaces this so students notice the mismatch.
     var isShorterThanSong = false
@@ -57,6 +59,17 @@ class Track: Identifiable {
 // so unsynchronized access is safe.
 private final class MeterThrottle: @unchecked Sendable {
     nonisolated(unsafe) var lastEmit: CFTimeInterval = 0
+}
+
+// Copy of the routing table readable from the render tap threads.
+private final class RoutingTable: @unchecked Sendable {
+    private let lock = NSLock()
+    private var channels: [Int] = []
+    func set(_ new: [Int]) { lock.lock(); channels = new; lock.unlock() }
+    func channel(forSlot slot: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return slot < channels.count ? channels[slot] : slot
+    }
 }
 
 // MARK: - 2. Audio Engine
@@ -86,6 +99,13 @@ class AudioPlayer {
     
     var showError = false
     var errorMessage = ""
+
+    // Track slot -> hardware output channel (0-based, -1 = unrouted).
+    // Deliberately session-only: it is never persisted, so every launch
+    // starts on outputs 1..N and a student can't inherit a stray routing.
+    var outputRouting: [Int] = Array(0..<12)
+    var outputChannelCount: Int { Int(hardwareFormat?.channelCount ?? 2) }
+    private let routingTable = RoutingTable()
     
     private let engine = AVAudioEngine()
     private let mainMixer = AVAudioMixerNode()
@@ -241,18 +261,21 @@ class AudioPlayer {
                 let trackObj = Track(id: index, url: url, file: file, sampleRate: sr, monoBuffer: mono)
                 trackObj.volume = vol
                 trackObj.isShorterThanSong = file.length < maxLength
+                trackObj.outputChannel = outputChannel(forSlot: index)
                 tracks.append(trackObj)
 
                 let throttle = MeterThrottle()
+                let routing = routingTable
                 player.installTap(onBus: 0, bufferSize: 1024, format: hwFormat) { [weak self] (buffer, time) in
                     guard let self = self else { return }
-                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: index, throttle: throttle)
+                    self.processMeter(buffer: buffer, trackIndex: index, channelIndex: routing.channel(forSlot: index), throttle: throttle)
                 }
             } catch {
                 self.errorMessage = "Error: \(error.localizedDescription)"
                 self.showError = true
             }
         }
+        routingTable.set(outputRouting)
         try? engine.start()
         playbackProgress = 0.0
         updateTimeLabel(progress: 0.0)
@@ -279,23 +302,24 @@ class AudioPlayer {
         // so scheduling time can't eat into the shared start deadline.
         for (i, player) in players.enumerated() {
             let mono = tracks[i].monoBuffer
+            let out = outputChannel(forSlot: i)
 
             if shouldLoop {
                 let loopStartFrame = AVAudioFramePosition(Double(audioLengthSamples) * loopStart)
 
                 let introLen = loopEndFrame - startFrame
-                if introLen > 0, let intro = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: i) {
+                if introLen > 0, let intro = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(introLen), targetChannel: out) {
                     player.scheduleBuffer(intro, at: nil, options: [], completionHandler: nil)
                 }
 
                 let loopLen = loopEndFrame - loopStartFrame
-                if loopLen > 0, let loop = makeSlice(from: mono, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: i) {
+                if loopLen > 0, let loop = makeSlice(from: mono, startFrame: loopStartFrame, frameCount: AVAudioFrameCount(loopLen), targetChannel: out) {
                     player.scheduleBuffer(loop, at: nil, options: .loops, completionHandler: nil)
                 }
 
             } else {
                 let length = audioLengthSamples - startFrame
-                if length > 0, let tail = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: i) {
+                if length > 0, let tail = makeSlice(from: mono, startFrame: startFrame, frameCount: AVAudioFrameCount(length), targetChannel: out) {
                     if i == 0 {
                         // One end-of-song signal is enough; the generation
                         // check drops callbacks from superseded schedules
@@ -338,10 +362,11 @@ class AudioPlayer {
     private func copySlice(from source: AVAudioPCMBuffer, to destination: AVAudioPCMBuffer, startFrame: AVAudioFramePosition, frameCount: AVAudioFrameCount, targetChannel: Int) {
         destination.frameLength = frameCount
         let destChannels = Int(destination.format.channelCount)
-        if targetChannel >= destChannels { return }
         for ch in 0..<destChannels {
             if let ptr = destination.floatChannelData?[ch] { memset(ptr, 0, Int(frameCount) * MemoryLayout<Float>.size) }
         }
+        // Unrouted or beyond the device's channel count: stays silent.
+        if targetChannel < 0 || targetChannel >= destChannels { return }
 
         // frameCount is sized to the longest stem; a shorter source only has
         // `available` frames past startFrame, the rest stays silent.
@@ -442,6 +467,34 @@ class AudioPlayer {
     }
     
     func restartIfPlaying() { if isPlaying { play(from: playbackProgress) } }
+
+    // MARK: - Output Routing
+    func outputChannel(forSlot slot: Int) -> Int {
+        slot < outputRouting.count ? outputRouting[slot] : slot
+    }
+
+    func setOutputChannel(_ channel: Int, forSlot slot: Int) {
+        while outputRouting.count <= slot { outputRouting.append(outputRouting.count) }
+        outputRouting[slot] = channel
+        applyRouting()
+    }
+
+    // Maps slot 0 -> `first`, slot 1 -> first+1, ... (e.g. outputs 13-24).
+    func shiftRouting(startingAt first: Int) {
+        let n = max(outputRouting.count, tracks.count)
+        outputRouting = (0..<n).map { first + $0 }
+        applyRouting()
+    }
+
+    func resetRouting() { shiftRouting(startingAt: 0) }
+
+    private func applyRouting() {
+        for track in tracks { track.outputChannel = outputChannel(forSlot: track.id) }
+        routingTable.set(outputRouting)
+        // Slices are built per play call, so a routing change takes effect
+        // by rescheduling from the current position.
+        restartIfPlaying()
+    }
     
     func resetLoop() { loopStart = 0.0; loopEnd = 1.0; if isPlaying && isLooping { restartIfPlaying() } }
     func setLoopIn() { loopStart = playbackProgress; if loopStart >= loopEnd { loopEnd = 1.0 }; if isPlaying && isLooping { restartIfPlaying() } }
@@ -484,7 +537,7 @@ class AudioPlayer {
         throttle.lastEmit = now
 
         guard let floatData = buffer.floatChannelData,
-              channelIndex < Int(buffer.format.channelCount),
+              channelIndex >= 0, channelIndex < Int(buffer.format.channelCount),
               buffer.frameLength > 0 else { return }
 
         var rms: Float = 0
@@ -712,7 +765,10 @@ func meterColor(level: Float) -> Color {
 
 struct TrackRow: View {
     let track: Track
+    let outputCount: Int
     var onVolumeChange: (Float) -> Void
+
+    private var isRouted: Bool { track.outputChannel >= 0 && track.outputChannel < outputCount }
     
     var volumeBinding: Binding<Float> {
         Binding(
@@ -724,10 +780,11 @@ struct TrackRow: View {
     var body: some View {
         HStack(spacing: 15) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("CH \(track.id + 1)")
+                Text(isRouted ? "OUT \(track.outputChannel + 1)" : "OUT —")
                     .font(.caption)
                     .fontWeight(.bold)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(isRouted ? .secondary : .orange)
+                    .help(isRouted ? "Playing on device output \(track.outputChannel + 1)" : "Not routed to an output on this device")
                 Text(track.name)
                     .font(.callout)
                     .lineLimit(1)
@@ -761,6 +818,102 @@ struct TrackRow: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
+    }
+}
+
+struct RoutingMatrixView: View {
+    let player: AudioPlayer
+    @Environment(\.dismiss) private var dismiss
+
+    private let cell: CGFloat = 26
+
+    // With no song loaded, show the generic 12 slots so routing can be set
+    // up before the student picks a song.
+    private var slotCount: Int { player.tracks.isEmpty ? player.outputRouting.count : player.tracks.count }
+    private var outputCount: Int { player.outputChannelCount }
+    private var deviceName: String { player.devices.first { $0.id == player.selectedDeviceID }?.name ?? "No Device" }
+
+    private func slotName(_ i: Int) -> String { i < player.tracks.count ? player.tracks[i].name : "Track \(i + 1)" }
+
+    // Contiguous blocks of `slotCount` outputs that fit on the device: 1–12, 13–24, ...
+    private var blockStarts: [Int] {
+        guard slotCount > 0 else { return [] }
+        return stride(from: 0, through: outputCount - slotCount, by: slotCount).map { $0 }
+    }
+
+    private var hasUnrouted: Bool {
+        (0..<slotCount).contains { let c = player.outputChannel(forSlot: $0); return c < 0 || c >= outputCount }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Output Routing").font(.title2).fontWeight(.bold)
+                    Text("\(deviceName) · \(outputCount) outputs").font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+
+            Text("Each row is a stem, each column is a device output. Click a cell to route; click the active cell again to mute that stem. Routing resets to outputs 1–\(slotCount) every time the app launches.")
+                .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Text("Quick set:").font(.caption).foregroundColor(.secondary)
+                ForEach(blockStarts, id: \.self) { start in
+                    Button("Outputs \(start + 1)–\(start + slotCount)") { player.shiftRouting(startingAt: start) }
+                }
+                Spacer()
+                Button("Reset to Default") { player.resetRouting() }
+            }
+
+            if hasUnrouted {
+                Label("Some stems are not routed to an output on this device and will be silent.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.orange)
+            }
+
+            ScrollView([.horizontal, .vertical]) {
+                Grid(horizontalSpacing: 2, verticalSpacing: 2) {
+                    GridRow {
+                        Text("").frame(width: 160)
+                        ForEach(0..<outputCount, id: \.self) { ch in
+                            Text("\(ch + 1)")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .frame(width: cell, height: cell)
+                        }
+                    }
+                    ForEach(0..<slotCount, id: \.self) { slot in
+                        let current = player.outputChannel(forSlot: slot)
+                        GridRow {
+                            Text(slotName(slot))
+                                .font(.callout).lineLimit(1).truncationMode(.tail)
+                                .frame(width: 160, alignment: .leading)
+                                .help(slotName(slot))
+                            ForEach(0..<outputCount, id: \.self) { ch in
+                                let active = current == ch
+                                Button {
+                                    player.setOutputChannel(active ? -1 : ch, forSlot: slot)
+                                } label: {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 4)
+                                            .fill(active ? Color.accentColor : Color.gray.opacity(0.18))
+                                        if active { Circle().fill(Color.white).frame(width: 8, height: 8) }
+                                    }
+                                    .frame(width: cell, height: cell)
+                                }
+                                .buttonStyle(.plain)
+                                .help("\(slotName(slot)) → Output \(ch + 1)")
+                            }
+                        }
+                    }
+                }
+                .padding(.trailing, 8)
+            }
+        }
+        .padding()
+        .frame(minWidth: 560, idealWidth: 200 + CGFloat(outputCount) * (cell + 2) + 48, minHeight: 320, idealHeight: 200 + CGFloat(slotCount + 1) * (cell + 2))
     }
 }
 
@@ -880,6 +1033,7 @@ struct ContentView: View {
     @State private var player = AudioPlayer()
     
     @State private var showShortcuts = false
+    @State private var showRouting = false
 
     private func unlockLibraryFolder() {
         let player = self.player
@@ -970,6 +1124,21 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                         .help("Reset all volume faders to 100%")
                         
+                        // Routing Matrix
+                        Button(action: { showRouting = true }) {
+                            HStack {
+                                Image(systemName: "rectangle.grid.3x2")
+                                Text("ROUTING").font(.caption).fontWeight(.bold)
+                            }
+                            .padding(8)
+                            .background(RoundedRectangle(cornerRadius: 6).stroke(Color.gray, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Choose which device outputs each stem plays on")
+                        .sheet(isPresented: $showRouting) {
+                            RoutingMatrixView(player: player)
+                        }
+
                         // Shortcuts Button
                         Button(action: { showShortcuts.toggle() }) {
                             HStack {
@@ -1033,7 +1202,7 @@ struct ContentView: View {
                     ScrollView {
                         VStack(spacing: 0) {
                             ForEach(player.tracks) { track in
-                                TrackRow(track: track) { newVol in
+                                TrackRow(track: track, outputCount: player.outputChannelCount) { newVol in
                                     player.setVolume(newVol, index: track.id)
                                 }
                                 Divider()
