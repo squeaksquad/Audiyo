@@ -1051,7 +1051,8 @@ struct ShortcutsView: View {
         ("I", "Set Loop In"),
         ("O", "Set Loop Out"),
         ("L", "Toggle loop on/off"),
-        ("CMD+Shift+L", "Reset loop region")
+        ("CMD+Shift+L", "Reset loop region"),
+        ("CMD+Shift+A", "Open Audio MIDI Setup")
     ]
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1159,6 +1160,11 @@ struct ContentView: View {
     
     @State private var showShortcuts = false
     @State private var showRouting = false
+
+    private func openAudioMIDISetup() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.audio.AudioMIDISetup") else { return }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
 
     private func unlockLibraryFolder() {
         let player = self.player
@@ -1296,7 +1302,13 @@ struct ContentView: View {
                             Button(action: { player.refreshHardwareState() }) {
                                 Image(systemName: "arrow.clockwise")
                             }
-                            .help("Reset CoreAudio")
+                            .help("Rescan Devices: re-read the CoreAudio device list and rebuild the engine")
+
+                            Button(action: openAudioMIDISetup) {
+                                Image(systemName: "slider.horizontal.3")
+                            }
+                            .help("Open Audio MIDI Setup (⌘⇧A)")
+                            .keyboardShortcut("a", modifiers: [.command, .shift])
                         }
                     }
                 }

@@ -14,7 +14,7 @@ Use Instructions:
 
 2. The audio device selector will pull from any available CoreAudio devices but it doesn’t like a device with truly excessive channel counts (256 is way too many), so 12-32 channels wide will work fine, 64 might also be okay but I haven’t tested that.
 
-3. There is a “Reset CoreAudio” button to the right of the Audio Device selector and it will scan for changes in the Core Audio devices. This is helpful when trying to adjust sample rate.
+3. There is a “Rescan Devices” button to the right of the Audio Device selector and it will scan for changes in the Core Audio devices and rebuild the audio engine. This is helpful when trying to adjust sample rate. Next to it is a button (or CMD+Shift+A) that opens Audio MIDI Setup for changing the device sample rate. If a device is misbehaving in every app, a full CoreAudio restart from Terminal (`sudo killall coreaudiod`) is the heavier fix.
 
 4. There is an error that shows up in red text at the bottom of the screen if the Core Audio device is at a different sample rate from the selected files. Since the mix library we’re using is at 44.1kHz, the audio device should be at 44.1kHz.
 
@@ -39,6 +39,8 @@ Use Instructions:
 	•	L; Toggle loop on/off
 
 	•	CMD+Shift+L; Reset loop region
+
+	•	CMD+Shift+A; Open Audio MIDI Setup
 
 9. The loaded library folder shows up on the left side bar and the 12 track or 8 track songs libraries can be expanded to show individual songs. Simply click on the song name to load it (or to reset all markers).
 
