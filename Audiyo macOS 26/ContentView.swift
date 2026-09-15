@@ -847,15 +847,17 @@ struct RoutingMatrixView: View {
     }
 
     private var cellGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
+        DragGesture(minimumDistance: 0, coordinateSpace: .named("routingCells"))
             .onChanged { value in
                 let point = value.location
                 if dragStartCell == nil {
+                    // Press: route the cell under the pointer right away.
                     guard let c = cellAt(point) else { return }
                     dragStartCell = c
                     dragStartWasActive = player.outputChannel(forSlot: c.slot) == c.ch
                     dragLastPoint = point
                     dragMoved = false
+                    route(c)
                     return
                 }
                 // Walk the segment from the last sample so fast sweeps
@@ -867,14 +869,15 @@ struct RoutingMatrixView: View {
                     let p = CGPoint(x: from.x + (point.x - from.x) * t, y: from.y + (point.y - from.y) * t)
                     if let c = cellAt(p) {
                         if let start = dragStartCell, c.slot != start.slot || c.ch != start.ch { dragMoved = true }
-                        if dragMoved { route(c) }
+                        route(c)
                     }
                 }
                 dragLastPoint = point
             }
             .onEnded { _ in
-                if let start = dragStartCell, !dragMoved {
-                    player.setOutputChannel(dragStartWasActive ? -1 : start.ch, forSlot: start.slot)
+                // A click on an already-active cell that never moved: mute it.
+                if let start = dragStartCell, !dragMoved, dragStartWasActive {
+                    player.setOutputChannel(-1, forSlot: start.slot)
                 }
                 dragStartCell = nil
                 dragLastPoint = nil
@@ -994,6 +997,7 @@ struct RoutingMatrixView: View {
                             }
                         }
                         .contentShape(Rectangle())
+                        .coordinateSpace(name: "routingCells")
                         .gesture(cellGesture)
                     }
                 }
